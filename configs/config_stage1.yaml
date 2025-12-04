@@ -1,0 +1,87 @@
+# 模型与数据路径
+# ---------------------------------------------------------
+# Qwen 文本模型（和 stage0 保持一致）
+model_path: "/home/yuqing/Models/Qwen2.5-7B-Instruct"
+
+# LLaVA-Med 对齐数据（你给的 llava_med_alignment_500k_subset.json）
+llava_med_json: "/home/yuqing/Datas/llava_med_alignment_500k_subset.json"
+
+# 对应图片目录
+llava_med_image_root: "/home/yuqing/Datas/llava_med_images"
+
+# 训练输出目录（权重 + 日志）
+output_dir: "../med_stage1_align_output"
+
+# BiomedCLIP 模型所在目录（biomedclip_backbone.py 里 LOCAL_DIR）
+biomedclip_model_dir: "/home/yuqing/Models/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+
+
+# 预提取 BiomedCLIP 图像特征
+# ---------------------------------------------------------
+# 你已经用 BiomedCLIPBackbone 跑过 600K 图像，把每张图片的全局特征保存成 .pt：
+#   /home/yuqing/Datas/llava_med_images/xxx.jpg
+#   -> /home/yuqing/Datas/llava_med_images_biomedclip_pt/xxx.pt
+#
+# 要求：
+#   - 特征是 1D 向量（形状 [512] 或 [1, 512]），可以是 tensor 或 numpy 数组
+#   - 如果保存成 dict，也可以，脚本会优先找 key: "img_feat" / "image_emb"
+llava_med_image_feature_dir: "/home/yuqing/Datas/llava_med_images_biomedclip_pt"
+
+
+
+# BiomedCLIP embedding 维度（从 BiomedCLIP config 里可知是 512）
+image_feat_dim: 512
+
+
+#BiomedCLIP的feature_batch_size
+feature_batch_size: 64
+# DataLoader 的 num_workers
+feature_num_workers: 4
+
+# 是否用 FP16 提特征（显存更省，一般 True 即可）
+feature_fp16: False
+
+# ---------------------------------------------------------
+# 例如: "4,5,6,7" => 使用物理 GPU 4/5/6/7；程序内部看到的是 cuda:0~3
+gpus: "0,1,2,3,4"
+
+
+# 训练超参数
+# ---------------------------------------------------------
+micro_batch_size: 4              # 每个 GPU 的 batch size
+gradient_accumulation_steps: 4   # 梯度累积步数
+learning_rate: 2.0e-4
+epochs: 2                        # 建议先 1 epoch 跑通流程，再按需调大
+max_length: 1024                 # chat template 展开后的最大 token 长度
+
+num_workers: 4                  # DataLoader 的 num_workers（多卡时每个进程的 worker 数）
+max_samples: 4000             # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null
+
+# 可选：给 LLM 一个统一的 system prompt
+system_prompt: "You are a helpful medical vision-language assistant. Describe the medical image in accurate and concise English."
+
+
+# LoRA 配置（和 stage0 保持一致）
+# ---------------------------------------------------------
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+
+# Vision Adapter（Prefix Token 版）配置
+# ---------------------------------------------------------
+vision_adapter:
+  enabled: true          # 是否启用图像前缀 token；设为 false 即退化为纯文本 Qwen + LoRA
+  type: "prefix"         # 目前只实现 prefix 版，后续可以扩展 cross-attn 等
+  use_image_feat: true   # 是否真的用 image_feat，如果做 ablation 可以关掉
+  prefix_dropout: 0.0    # prefix token 上的 dropout，通常 0 或 0.1
+
