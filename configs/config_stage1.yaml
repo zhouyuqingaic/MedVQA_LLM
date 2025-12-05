@@ -55,7 +55,7 @@ epochs: 2                        # 建议先 1 epoch 跑通流程，再按需调
 max_length: 1024                 # chat template 展开后的最大 token 长度
 
 num_workers: 4                  # DataLoader 的 num_workers（多卡时每个进程的 worker 数）
-max_samples: 4000             # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null
+max_samples: 15000             # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null
 
 # 可选：给 LLM 一个统一的 system prompt
 system_prompt: "You are a helpful medical vision-language assistant. Describe the medical image in accurate and concise English."
@@ -84,4 +84,5 @@ vision_adapter:
   type: "prefix"         # 目前只实现 prefix 版，后续可以扩展 cross-attn 等
   use_image_feat: true   # 是否真的用 image_feat，如果做 ablation 可以关掉
   prefix_dropout: 0.0    # prefix token 上的 dropout，通常 0 或 0.1
+  num_prefix_tokens: 33  #多 token 模式的token数
 

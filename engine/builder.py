@@ -73,11 +73,13 @@ def build_vision_llm(
                 f"[Stage1] image_feat_dim={image_feat_dim}, prefix_dropout={prefix_dropout}, use_image_feat={use_image_feat}")
 
         # 将 LoRA 基座模型包装进 Vision Adapter
+        num_prefix_tokens=vision_cfg["num_prefix_tokens"] #设置多prefix token模式
         model = QwenVisionPrefixModel(
             llm=base_model,
             image_feat_dim=image_feat_dim,
             prefix_dropout=prefix_dropout,
             use_image_feat=use_image_feat,
+            num_prefix_tokens=num_prefix_tokens,
         ).to(current_device)
     else:
         if rank == 0:
