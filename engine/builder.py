@@ -12,6 +12,7 @@ from torch.nn import Module
 # 从 utils 层导入必要的工具
 from utils.model_utils import load_tokenizer, build_qlora_base_model, print_trainable_parameters
 from models.qwen_vision_prefix import QwenVisionPrefixModel
+from models.qwen_vision_adapter import QwenWithVisionAdapter   # 新增
 
 
 def build_vision_llm(
@@ -67,23 +68,48 @@ def build_vision_llm(
 
     # 4. 包装 Vision Prefix Adapter
     if vision_enabled:
-        if rank == 0:
-            print("[Stage1] 启用 Vision Prefix Adapter (image_feat -> prefix token)")
-            print(
-                f"[Stage1] image_feat_dim={image_feat_dim}, prefix_dropout={prefix_dropout}, use_image_feat={use_image_feat}")
+        adapter_type = vision_cfg.get("type", "prefix")
 
-        # 将 LoRA 基座模型包装进 Vision Adapter
-        num_prefix_tokens=vision_cfg["num_prefix_tokens"] #设置多prefix token模式
-        model = QwenVisionPrefixModel(
-            llm=base_model,
-            image_feat_dim=image_feat_dim,
-            prefix_dropout=prefix_dropout,
-            use_image_feat=use_image_feat,
-            num_prefix_tokens=num_prefix_tokens,
-        ).to(current_device)
+        if adapter_type == "prefix":
+            # ----------------- 原有 Prefix Token 模式 -----------------
+            if rank == 0:
+                print("[Stage1] 使用 Vision Prefix Adapter (global + slot tokens)")
+
+            num_prefix_tokens = int(vision_cfg.get("num_prefix_tokens", 1))
+            model = QwenVisionPrefixModel(
+                llm=base_model,
+                image_feat_dim=image_feat_dim,
+                prefix_dropout=prefix_dropout,
+                use_image_feat=use_image_feat,
+                num_prefix_tokens=num_prefix_tokens,
+            ).to(current_device)
+
+        elif adapter_type == "cross_attn":
+            # ----------------- 新增 Cross-Attn Adapter 模式 -----------------
+            if rank == 0:
+                print("[Stage1] 使用 Cross-Attn Vision Adapter (QwenWithVisionAdapter)")
+
+            num_image_tokens = int(vision_cfg.get("num_image_tokens", 4))
+            cross_attn_heads = int(vision_cfg.get("cross_attn_heads", 8))
+            cross_attn_dropout = float(vision_cfg.get("cross_attn_dropout", 0.0))
+            use_gate = bool(vision_cfg.get("use_gate", True))
+
+            model = QwenWithVisionAdapter(
+                llm=base_model,
+                image_feat_dim=image_feat_dim,
+                num_image_tokens=num_image_tokens,
+                cross_attn_heads=cross_attn_heads,
+                cross_attn_dropout=cross_attn_dropout,
+                use_image_feat=use_image_feat,
+                use_gate=use_gate,
+            ).to(current_device)
+
+        else:
+            raise ValueError(f"[Stage1] 未知的 vision_adapter.type = {adapter_type}")
     else:
         if rank == 0:
             print("[Stage1] 未启用 Vision Adapter，退化为纯文本 Qwen + LoRA")
         model = base_model
+
 
     return model, tokenizer, image_feat_dim

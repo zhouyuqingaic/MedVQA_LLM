@@ -43,7 +43,7 @@ feature_fp16: False
 
 # ---------------------------------------------------------
 # 例如: "4,5,6,7" => 使用物理 GPU 4/5/6/7；程序内部看到的是 cuda:0~3
-gpus: "0,1,2,3,4"
+gpus: "0,1,2,3,4,5,6,7"
 
 
 # 训练超参数
@@ -51,11 +51,11 @@ gpus: "0,1,2,3,4"
 micro_batch_size: 4              # 每个 GPU 的 batch size
 gradient_accumulation_steps: 4   # 梯度累积步数
 learning_rate: 2.0e-4
-epochs: 2                        # 建议先 1 epoch 跑通流程，再按需调大
+epochs: 3                        # 建议先 1 epoch 跑通流程，再按需调大
 max_length: 1024                 # chat template 展开后的最大 token 长度
 
 num_workers: 4                  # DataLoader 的 num_workers（多卡时每个进程的 worker 数）
-max_samples: 15000             # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null
+max_samples: 25000             # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null
 
 # 可选：给 LLM 一个统一的 system prompt
 system_prompt: "You are a helpful medical vision-language assistant. Describe the medical image in accurate and concise English."
@@ -84,5 +84,11 @@ vision_adapter:
   type: "prefix"         # 目前只实现 prefix 版，后续可以扩展 cross-attn 等
   use_image_feat: true   # 是否真的用 image_feat，如果做 ablation 可以关掉
   prefix_dropout: 0.0    # prefix token 上的 dropout，通常 0 或 0.1
-  num_prefix_tokens: 33  #多 token 模式的token数
+  num_prefix_tokens: 64  #多 token 模式的token数
+
+  # ==== 以下是 Cross-Attn Adapter 专用配置 ====
+  num_image_tokens: 4      # 把 image_feat 投影成多少个视觉 token M
+  cross_attn_heads: 8      # Cross-Attn 的多头数量
+  cross_attn_dropout: 0.0  # Cross-Attn 内部 dropout，建议 0 ~ 0.1
+  use_gate: true           # 是否使用可学习 gate 控制视觉注入强度
 
