@@ -55,7 +55,7 @@ epochs: 3                        # 建议先 1 epoch 跑通流程，再按需调
 max_length: 1024                 # chat template 展开后的最大 token 长度
 
 num_workers: 4                  # DataLoader 的 num_workers（多卡时每个进程的 worker 数）
-max_samples: 25000             # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null
+max_samples: null            # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null
 
 # 可选：给 LLM 一个统一的 system prompt
 system_prompt: "You are a helpful medical vision-language assistant. Describe the medical image in accurate and concise English."
@@ -81,7 +81,7 @@ lora:
 # ---------------------------------------------------------
 vision_adapter:
   enabled: true          # 是否启用图像前缀 token；设为 false 即退化为纯文本 Qwen + LoRA
-  type: "prefix"         # 目前只实现 prefix 版，后续可以扩展 cross-attn 等
+  type: "cross_attn"         # 目前只实现 prefix 版，后续可以扩展 cross_attn 等
   use_image_feat: true   # 是否真的用 image_feat，如果做 ablation 可以关掉
   prefix_dropout: 0.0    # prefix token 上的 dropout，通常 0 或 0.1
   num_prefix_tokens: 64  #多 token 模式的token数
@@ -92,3 +92,12 @@ vision_adapter:
   cross_attn_dropout: 0.0  # Cross-Attn 内部 dropout，建议 0 ~ 0.1
   use_gate: true           # 是否使用可学习 gate 控制视觉注入强度
 
+  # ==== 新增：Projector 配置 ====
+  # linear / mlp / multihead / moe
+  projector_type: "multihead"
+
+  # 对应不同类型的可选超参（用不到可以留空或删掉）
+  mlp_hidden_dim: 512          # None 表示使用 input_dim
+  multihead_inner_dim: 512     # None 表示使用 input_dim
+  moe_num_experts: 4
+  moe_top_k: 2

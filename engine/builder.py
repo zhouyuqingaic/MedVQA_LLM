@@ -94,6 +94,13 @@ def build_vision_llm(
             cross_attn_dropout = float(vision_cfg.get("cross_attn_dropout", 0.0))
             use_gate = bool(vision_cfg.get("use_gate", True))
 
+            # 新增：Projector 相关配置
+            projector_type = vision_cfg.get("projector_type", "mlp")
+            mlp_hidden_dim = vision_cfg.get("mlp_hidden_dim", None)
+            multihead_inner_dim = vision_cfg.get("multihead_inner_dim", None)
+            moe_num_experts = int(vision_cfg.get("moe_num_experts", 4))
+            moe_top_k = int(vision_cfg.get("moe_top_k", 2))
+
             model = QwenWithVisionAdapter(
                 llm=base_model,
                 image_feat_dim=image_feat_dim,
@@ -102,6 +109,11 @@ def build_vision_llm(
                 cross_attn_dropout=cross_attn_dropout,
                 use_image_feat=use_image_feat,
                 use_gate=use_gate,
+                projector_type=projector_type,
+                mlp_hidden_dim=mlp_hidden_dim,
+                multihead_inner_dim=multihead_inner_dim,
+                moe_num_experts=moe_num_experts,
+                moe_top_k=moe_top_k,
             ).to(current_device)
 
         else:
