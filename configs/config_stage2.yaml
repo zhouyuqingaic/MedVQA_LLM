@@ -23,6 +23,13 @@ stage1_ckpt_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/med_stage1_align_ou
 # 默认模态（可被命令行 --modality 覆盖）
 modality: "text"   # "text" 或 "multi"
 
+# ==========================
+# 数据缓存路径（HF datasets）
+# ==========================
+vqa_rad_cache: "/home/yuqing/Datas/vqa-rad/vqa-rad"
+path_vqa_cache: "/home/yuqing/Datas/vqa-rad/path-vqa"
+
+
 # ---------------------------
 # 文本-only Stage-2 配置
 # ---------------------------

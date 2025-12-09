@@ -265,6 +265,54 @@ class PathVQAHFDataset(Dataset):
         return sample
 
 
+def build_hf_vqa_dataset(
+    dataset_name: str,
+    split: str,
+    cache_dir: Optional[str] = None,
+    max_samples: Optional[int] = None,
+):
+    """
+    使用 med_vqa_datasets.vqa_rad_path_hf 中的 VQARADHFDataset / PathVQAHFDataset
+    来构建 HF 版本的 VQA 数据集。
+
+    返回的数据样本包含：
+        - image   : PIL.Image 或 tensor（我们在 text-only 模式下可以忽略）
+        - question: str
+        - answer  : str
+    """
+    dataset_name = dataset_name.lower()
+
+    if dataset_name == "vqa-rad":
+        hf_name = "flaviagiammarino/vqa-rad"
+        ds_cls = VQARADHFDataset
+    elif dataset_name == "path-vqa":
+        hf_name = "flaviagiammarino/path-vqa"
+        ds_cls = PathVQAHFDataset
+    else:
+        raise ValueError(f"[build_hf_vqa_dataset] 未知的数据集名称: {dataset_name}")
+
+    hf_dataset = load_dataset(hf_name, cache_dir=cache_dir)
+
+    if split not in hf_dataset:
+        raise ValueError(
+            f"[build_hf_vqa_dataset] split='{split}' 不存在于 {hf_name} 数据集，可用 split: {list(hf_dataset.keys())}"
+        )
+
+    hf_split = hf_dataset[split]
+
+    if max_samples is not None and max_samples > 0:
+        max_samples = min(max_samples, len(hf_split))
+        hf_split = hf_split.select(range(max_samples))
+
+    # 这里不在 dataset 内部做 tokenizer / image_transform，全部交给下游（collator + BiomedCLIP）
+    ds = ds_cls(
+        hf_split=hf_split,
+        image_transform=None,
+        tokenizer=None,
+    )
+    return ds
+
+
 def build_path_vqa_dataloaders(
     cache_dir: str,
     batch_size: int = 8,

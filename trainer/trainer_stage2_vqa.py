@@ -37,6 +37,12 @@ from transformers import (
     PreTrainedTokenizerBase,
     set_seed,
 )
+from med_vqa_datasets.vqa_rad_path_hf import (
+    build_hf_vqa_dataset)  # 调用 HF 封装
+from med_vqa_datasets.collators import (
+    VQATextDataCollator,
+    VQAMultimodalDataCollator)
+
 
 # 项目内模块
 from utils.ddp import setup_ddp, cleanup_ddp, launch_ddp
@@ -104,249 +110,9 @@ def load_stage1_checkpoint(model: torch.nn.Module, ckpt_dir: str, device: torch.
         if unexpected:
             print("  unexpected keys (前 5 个):", unexpected[:5])
 
-
-# ===========================
-# 文本-only VQA 数据集
-# ===========================
-
-class HFVQATextDataset(Dataset):
-    """
-    文本-only VQA 数据集封装：
-    - 仅使用 question / answer 字段，不加载图像
-    - dataset_name: "vqa-rad" 或 "path-vqa"
-    """
-
-    def __init__(
-        self,
-        dataset_name: str,
-        split: str,
-        max_samples: Optional[int] = None,
-        cache_dir: Optional[str] = None,
-    ) -> None:
-        dataset_name = dataset_name.lower()
-        if dataset_name == "vqa-rad":
-            hf_name = "flaviagiammarino/vqa-rad"
-        elif dataset_name == "path-vqa":
-            hf_name = "flaviagiammarino/path-vqa"
-        else:
-            raise ValueError(f"[HFVQATextDataset] 未知的数据集名称: {dataset_name}")
-
-        self.dataset = load_dataset(hf_name, split=split, cache_dir=cache_dir)
-
-        if max_samples is not None and max_samples > 0:
-            max_samples = min(max_samples, len(self.dataset))
-            self.dataset = self.dataset.select(range(max_samples))
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        row = self.dataset[int(idx)]
-        return {
-            "question": row["question"],
-            "answer": row["answer"],
-        }
-
-
-# ===========================
-# 多模态 VQA 数据集
-# ===========================
-
-class HFVQAMultimodalDataset(Dataset):
-    """
-    多模态 VQA 数据集封装：
-    - 返回 image (PIL.Image)、question、answer
-    - dataset_name: "vqa-rad" 或 "path-vqa"
-    """
-
-    def __init__(
-        self,
-        dataset_name: str,
-        split: str,
-        max_samples: Optional[int] = None,
-        cache_dir: Optional[str] = None,
-    ) -> None:
-        dataset_name = dataset_name.lower()
-        if dataset_name == "vqa-rad":
-            hf_name = "flaviagiammarino/vqa-rad"
-        elif dataset_name == "path-vqa":
-            hf_name = "flaviagiammarino/path-vqa"
-        else:
-            raise ValueError(f"[HFVQAMultimodalDataset] 未知的数据集名称: {dataset_name}")
-
-        self.dataset = load_dataset(hf_name, split=split, cache_dir=cache_dir)
-
-        if max_samples is not None and max_samples > 0:
-            max_samples = min(max_samples, len(self.dataset))
-            self.dataset = self.dataset.select(range(max_samples))
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        row = self.dataset[int(idx)]
-        return {
-            "image": row["image"],      # PIL.Image.Image
-            "question": row["question"],
-            "answer": row["answer"],
-        }
-
-
-# ===========================
-# Data Collator：文本-only
-# ===========================
-
-@dataclass
-class VQATextDataCollator:
-    """
-    文本-only 模式的 collator：
-
-    - 使用 tokenizer.apply_chat_template 构造对话：
-        [system] (可选)
-        [user]      -> question (+ 提示当前看不到图像)
-        [assistant] -> answer
-    - 然后统一 padding / truncation
-    - labels 对所有非 padding token 监督（后续你可以改成只监督 assistant 段）
-    """
-
-    tokenizer: PreTrainedTokenizerBase
-    max_length: int = 512
-    system_prompt: Optional[str] = None
-    add_image_hint: bool = True
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        conversations: List[str] = []
-
-        for f in features:
-            q = f["question"]
-            a = f["answer"]
-
-            messages: List[Dict[str, str]] = []
-            if self.system_prompt:
-                messages.append({"role": "system", "content": self.system_prompt})
-
-            user_content = q
-            if self.add_image_hint:
-                user_content = (
-                    "You are a medical AI assistant.\n"
-                    "You do NOT have access to the image, only the text question.\n\n"
-                    f"Question: {q}"
-                )
-            messages.append({"role": "user", "content": user_content})
-            messages.append({"role": "assistant", "content": a})
-
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            conversations.append(text)
-
-        enc = self.tokenizer(
-            conversations,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        input_ids = enc["input_ids"]
-        attention_mask = enc["attention_mask"]
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-
-# ===========================
-# Data Collator：多模态
-# ===========================
-
-@dataclass
-class VQAMultimodalDataCollator:
-    """
-    多模态模式的 collator：
-
-    - 使用 BiomedCLIPBackbone.preprocess + encode_image 将图像编码为 [B, D_img] 特征
-    - 使用 tokenizer.apply_chat_template 构造对话：
-        [system] (可选)
-        [user]      -> question
-        [assistant] -> answer
-    - 返回：
-        input_ids, attention_mask, labels, image_feat
-      其中 image_feat 会被 HF Trainer 自动作为关键字参数传入 model.forward(image_feat=...)
-    """
-
-    tokenizer: PreTrainedTokenizerBase
-    biomed_clip: BiomedCLIPBackbone
-    max_length: int = 512
-    system_prompt: Optional[str] = None
-
-    def __post_init__(self):
-        # BiomedCLIP 模型内部自己会管理 device，这里只保留一个标记
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        images = [f["image"] for f in features]
-        questions = [f["question"] for f in features]
-        answers = [f["answer"] for f in features]
-
-        # 1) 图像编码 -> BiomedCLIP 特征
-        with torch.no_grad():
-            # preprocess 返回单张图的 transform，这里逐张处理再 cat 成 batch
-            pixel_list = [self.biomed_clip.preprocess(img).unsqueeze(0) for img in images]
-            pixel_values = torch.cat(pixel_list, dim=0)  # [B, 3, H, W]
-            pixel_values = pixel_values.to(self.device)
-
-            image_feat = self.biomed_clip.encode_image(pixel_values)  # [B, D] 或 [B, 1, D]
-            if image_feat.ndim == 3:
-                # 兼容 [B, 1, D] 的情况
-                image_feat = image_feat.squeeze(1)
-            image_feat = image_feat.float().cpu()  # 先搬回 CPU，Trainer 会自动分发到各自设备
-
-        # 2) 文本部分 -> chat 模板
-        conversations: List[str] = []
-        for q, a in zip(questions, answers):
-            messages: List[Dict[str, str]] = []
-            if self.system_prompt:
-                messages.append({"role": "system", "content": self.system_prompt})
-            messages.append({"role": "user", "content": f"Question: {q}"})
-            messages.append({"role": "assistant", "content": a})
-
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            conversations.append(text)
-
-        enc = self.tokenizer(
-            conversations,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        input_ids = enc["input_ids"]
-        attention_mask = enc["attention_mask"]
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "image_feat": image_feat,
-        }
-
-
 # ===========================
 # Stage-2 训练主体（单进程）
 # ===========================
-
 def run_training(rank: int, world_size: int, config: Dict[str, Any]):
     """
     每个 GPU / rank 上的训练入口，由 utils.ddp.launch_ddp 启动。
@@ -362,6 +128,8 @@ def run_training(rank: int, world_size: int, config: Dict[str, Any]):
     """
     from transformers import logging as hf_logging
     hf_logging.set_verbosity_warning()
+
+
 
     try:
         # 1) 初始化 DDP
@@ -403,6 +171,22 @@ def run_training(rank: int, world_size: int, config: Dict[str, Any]):
 
         set_seed(SEED + rank)
 
+        # 顶层 config 里的 HF 数据缓存路径
+        VQA_RAD_CACHE = config.get("vqa_rad_cache", None)
+        PATH_VQA_CACHE = config.get("path_vqa_cache", None)
+
+        dataset_lower = DATASET_NAME.lower()
+        if CACHE_DIR is not None:
+            data_cache_dir = CACHE_DIR
+        else:
+            if dataset_lower == "vqa-rad":
+                data_cache_dir = VQA_RAD_CACHE
+            elif dataset_lower == "path-vqa":
+                data_cache_dir = PATH_VQA_CACHE
+            else:
+                data_cache_dir = None
+
+
         # 3) 构建 Vision LLM 模型（结构与 Stage-1 一致）
         compute_dtype = torch.bfloat16 if USE_BF16 else torch.float32
 
@@ -428,22 +212,22 @@ def run_training(rank: int, world_size: int, config: Dict[str, Any]):
                 if name.startswith("image_proj") or name.startswith("cross_attn") or name.startswith("gate"):
                     param.requires_grad = False
 
-        # 5) 构建 Stage-2 数据集 & collator
+        # 5) 构建 Dataset & DataCollator
         if modality == "text":
             if rank == 0:
-                print("[Stage2] 使用文本-only VQA 数据集（不加载图像）。")
+                print("[Stage2] 使用文本-only VQA 数据集（不加载图像特征，仅使用 question/answer 文本）。")
 
-            train_dataset = HFVQATextDataset(
+            train_dataset = build_hf_vqa_dataset(
                 dataset_name=DATASET_NAME,
                 split=TRAIN_SPLIT,
+                cache_dir=data_cache_dir,
                 max_samples=MAX_TRAIN_SAMPLES,
-                cache_dir=CACHE_DIR,
             )
-            eval_dataset = HFVQATextDataset(
+            eval_dataset = build_hf_vqa_dataset(
                 dataset_name=DATASET_NAME,
                 split=EVAL_SPLIT,
+                cache_dir=data_cache_dir,
                 max_samples=MAX_EVAL_SAMPLES,
-                cache_dir=CACHE_DIR,
             )
 
             data_collator = VQATextDataCollator(
@@ -452,35 +236,26 @@ def run_training(rank: int, world_size: int, config: Dict[str, Any]):
                 system_prompt=system_prompt,
                 add_image_hint=True,
             )
-
         else:  # modality == "multi"
             if rank == 0:
                 print("[Stage2] 使用多模态 VQA 数据集（图像 + 文本）。")
 
-            train_dataset = HFVQAMultimodalDataset(
+            train_dataset = build_hf_vqa_dataset(
                 dataset_name=DATASET_NAME,
                 split=TRAIN_SPLIT,
+                cache_dir=data_cache_dir,
                 max_samples=MAX_TRAIN_SAMPLES,
-                cache_dir=CACHE_DIR,
             )
-            eval_dataset = HFVQAMultimodalDataset(
+            eval_dataset = build_hf_vqa_dataset(
                 dataset_name=DATASET_NAME,
                 split=EVAL_SPLIT,
+                cache_dir=data_cache_dir,
                 max_samples=MAX_EVAL_SAMPLES,
-                cache_dir=CACHE_DIR,
             )
 
-            biomedclip_dir = stage2_cfg.get("biomedclip_model_dir", None)
-            if biomedclip_dir is None:
-                raise ValueError(
-                    "[Stage2] multi 模式需要在配置中提供 biomedclip_model_dir，"
-                    "用于加载 BiomedCLIPBackbone。"
-                )
-
-            # 每个 rank 各自构建一个 BiomedCLIPBackbone，放在对应 GPU 上
             biomed_clip = BiomedCLIPBackbone(
-                model_name_or_path=biomedclip_dir,
-                device=f"cuda:{current_device}",
+                model_dir=stage2_cfg["biomedclip_model_dir"],
+                device=torch.device(f"cuda:{current_device}"),
             )
 
             data_collator = VQAMultimodalDataCollator(
