@@ -1,0 +1,153 @@
+# configs/config_stage2.yaml
+#
+# 统一的 Stage-2 配置文件：
+# - 顶层有公共配置：gpus、stage1_ckpt_dir
+# - text: 文本-only 模式专用配置
+# - multi: 多模态模式专用配置
+#
+# 注意：
+#   1. text 和 multi 两块下面的字段会直接传给 engine.builder.build_vision_llm，
+#      因此需要包含：
+#          - model_path
+#          - lora: { r, alpha, dropout, target_modules }
+#          - vision_adapter: { enabled, type, ... }
+#          - image_feat_dim
+#   2. 如果你想完全复用 Stage-1 的结构，只需把 Stage-1 的这些字段复制过来即可。
+#   3. Stage-2 会使用 stage1_ckpt_dir 加载 Stage-1 训练好的权重。
+
+gpus: "0,1"    # 或 "0,1,2,3" 等，根据你机器改
+
+# Stage-1 输出目录（就是你给出的那个路径）
+stage1_ckpt_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/med_stage1_align_output"
+
+# 默认模态（可被命令行 --modality 覆盖）
+modality: "text"   # "text" 或 "multi"
+
+# ---------------------------
+# 文本-only Stage-2 配置
+# ---------------------------
+text:
+  # === 与 Stage-1 构模相关的部分（请保持一致） ===
+  model_path: "/home/yuqing/Models/Qwen2.5-7B-Instruct"
+  image_feat_dim: 512
+
+  lora:
+    r: 16          # 这里也一样改成 16
+    alpha: 128
+    dropout: 0.05
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "gate_proj"
+      - "up_proj"
+      - "down_proj"
+
+  vision_adapter:
+    enabled: true               # 仍然使用 Stage-1 的 Vision Adapter 结构
+    type: "cross_attn"          # 或 "prefix" —— 请与 Stage-1 保持一致
+    num_image_tokens: 4
+    cross_attn_heads: 8
+    cross_attn_dropout: 0.0
+    use_gate: true
+    use_image_feat: false       # 🌟 关键：文本-only 模式关闭图像分支（但结构仍是多模态）
+    projector_type: "mlp"
+    mlp_hidden_dim: null
+    multihead_inner_dim: null
+    moe_num_experts: 4
+    moe_top_k: 2
+    prefix_dropout: 0.0         # 若使用 prefix，可在此处设置
+
+  # === Stage-2 训练相关超参 ===
+  output_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/stage2_vqa_text_vqa_rad"
+  dataset_name: "vqa-rad"       # 或 "path-vqa"
+  train_split: "train"
+  eval_split: "test"            # 对于 path-vqa 可以设置为 "validation"
+  cache_dir: null
+
+  micro_batch_size: 4
+  eval_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  epochs: 3
+  max_length: 512
+  num_workers: 4
+  bf16: true
+  max_train_samples: null       # 调试时可以设成 512
+  max_eval_samples: null
+  seed: 42
+
+  system_prompt: |
+    You are a helpful medical AI assistant for visual question answering.
+    In this training stage you will NOT see the image, only the text question.
+    Please answer as accurately and concisely as possible.
+
+# ---------------------------
+# 多模态 Stage-2 配置
+# ---------------------------
+multi:
+  # === 与 Stage-1 构模相关的部分（请保持一致） ===
+  model_path: "/home/yuqing/Models/Qwen2.5-7B-Instruct"
+  image_feat_dim: 512
+
+  lora:
+    r: 16          # 这里也一样改成 16
+    alpha: 128
+    dropout: 0.05
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "gate_proj"
+      - "up_proj"
+      - "down_proj"
+
+  vision_adapter:
+    enabled: true
+    type: "cross_attn"
+
+    # 仅这一项和 Stage-1 不同：文本-only 训练时关掉图像特征输入
+    use_image_feat: false
+
+    prefix_dropout: 0.0
+    num_prefix_tokens: 64
+
+    num_image_tokens: 4
+    cross_attn_heads: 8
+    cross_attn_dropout: 0.0
+    use_gate: true
+
+    projector_type: "multihead"
+    mlp_hidden_dim: 512
+    multihead_inner_dim: 512
+    moe_num_experts: 4
+    moe_top_k: 2
+
+  # BiomedCLIP 模型目录（需替换成你本地的路径）
+  biomedclip_model_dir: "/path/to/your/biomedclip"
+
+  # === Stage-2 训练相关超参 ===
+  output_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/stage2_vqa_multi_vqa_rad"
+  dataset_name: "vqa-rad"       # 或 "path-vqa"
+  train_split: "train"
+  eval_split: "test"
+  cache_dir: null
+
+  micro_batch_size: 2           # 多模态一般显存更紧张
+  eval_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  epochs: 3
+  max_length: 512
+  num_workers: 4
+  bf16: true
+  max_train_samples: null
+  max_eval_samples: null
+  seed: 42
+
+  system_prompt: |
+    You are a helpful medical AI assistant for visual question answering on radiology/pathology images.
+    You will receive both the image (encoded by BiomedCLIP) and the text question.
+    Please provide concise and accurate answers.
