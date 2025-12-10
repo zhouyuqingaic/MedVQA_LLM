@@ -172,7 +172,7 @@ class VQAMultimodalDataCollator:
 
     def __post_init__(self):
         # BiomedCLIP 模型内部自己会管理 device，这里只保留一个标记
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = self.biomed_clip.device
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         images = [f["image"] for f in features]

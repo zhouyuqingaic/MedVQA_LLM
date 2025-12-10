@@ -15,7 +15,7 @@
 #   2. 如果你想完全复用 Stage-1 的结构，只需把 Stage-1 的这些字段复制过来即可。
 #   3. Stage-2 会使用 stage1_ckpt_dir 加载 Stage-1 训练好的权重。
 
-gpus: "0,1"    # 或 "0,1,2,3" 等，根据你机器改
+gpus: "0,1,2,3"    # 或 "0,1,2,3" 等，根据你机器改
 
 # Stage-1 输出目录（就是你给出的那个路径）
 stage1_ckpt_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/med_stage1_align_output"
@@ -67,8 +67,8 @@ text:
     prefix_dropout: 0.0         # 若使用 prefix，可在此处设置
 
   # === Stage-2 训练相关超参 ===
-  output_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/stage2_vqa_text_vqa_rad"
-  dataset_name: "vqa-rad"       # 或 "path-vqa"
+  output_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/stage2_vqa_text_path_vqa" #或者stage2_vqa_text_vqa_rad,stage2_vqa_text_path_vqa
+  dataset_name: "path-vqa"       # 或 "path-vqa","vqa-rad"
   train_split: "train"
   eval_split: "test"            # 对于 path-vqa 可以设置为 "validation"
   cache_dir: null
@@ -115,8 +115,8 @@ multi:
     enabled: true
     type: "cross_attn"
 
-    # 仅这一项和 Stage-1 不同：文本-only 训练时关掉图像特征输入
-    use_image_feat: false
+    # ✅ 多模态阶段必须打开图像分支
+    use_image_feat: true
 
     prefix_dropout: 0.0
     num_prefix_tokens: 64
@@ -133,11 +133,11 @@ multi:
     moe_top_k: 2
 
   # BiomedCLIP 模型目录（需替换成你本地的路径）
-  biomedclip_model_dir: "/path/to/your/biomedclip"
+  biomedclip_model_dir: "/home/yuqing/Models/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
 
   # === Stage-2 训练相关超参 ===
-  output_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/stage2_vqa_multi_vqa_rad"
-  dataset_name: "vqa-rad"       # 或 "path-vqa"
+  output_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/stage2_vqa_multi_path_vqa" #或者:stage2_vqa_multi_vqa_rad,stage2_vqa_multi_path_vqa
+  dataset_name: "path-vqa"       # 或 "path-vqa","vqa-rad"
   train_split: "train"
   eval_split: "test"
   cache_dir: null

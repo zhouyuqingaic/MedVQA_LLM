@@ -27,7 +27,7 @@ from med_vqa_datasets.dataset_llava_med_alignment_500k_subset import build_llava
 from med_vqa_datasets.collators import LlavaMedChatCollator
 
 # === 从 Engine 层导入依赖 ===
-from engine.builder import build_vision_llm
+from utils.builder import build_vision_llm
 
 
 def run_training(rank: int, world_size: int, config: Dict[str, Any]):

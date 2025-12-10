@@ -24,17 +24,13 @@ os.environ["http_proxy"]="http://10.109.70.128:7897"
 os.environ["https_proxy"]="http://10.109.70.128:7897"
 
 import sys
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import torch
-from torch.utils.data import Dataset
 
-from datasets import load_dataset
 from transformers import (
     Trainer,
     TrainingArguments,
-    PreTrainedTokenizerBase,
     set_seed,
 )
 from med_vqa_datasets.vqa_rad_path_hf import (
@@ -47,7 +43,7 @@ from med_vqa_datasets.collators import (
 # 项目内模块
 from utils.ddp import setup_ddp, cleanup_ddp, launch_ddp
 from utils.config import load_config, get_gpus_and_world_size
-from engine.builder import build_vision_llm
+from utils.builder import build_vision_llm
 from backbones.biomedclip_backbone import BiomedCLIPBackbone  # 多模态模式需要
 
 
