@@ -7,76 +7,81 @@
 import torch
 from typing import List, Dict, Any
 from transformers import PreTrainedTokenizerBase
+from PIL import Image
+import os
 
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
-
+import hashlib
 import torch
 from transformers import PreTrainedTokenizerBase
 
 from backbones.biomedclip_backbone import BiomedCLIPBackbone
 
 
+@dataclass
 class LlavaMedChatCollator:
-    """
-    将 LLaVAMedAlignmentDataset 返回的样本列表 (batch) 转换成模型可直接训练的 batch。
+    tokenizer: Any
+    max_length: int = 512
 
-    核心功能：
-    - 使用 tokenizer.apply_chat_template 将多轮对话拼成一个长文本。
-    - 对文本进行 padding & truncation。
-    - 构造 labels (通常 labels = input_ids，padding 设为 -100)。
-    - 堆叠 image_feat。
-    """
+    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        prompt_texts, full_texts = [], []
+        feats = []
 
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, max_length: int):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+        for ex in examples:
+            chat = ex["chat"]
+            feats.append(ex["image_feat"])
 
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # 1. 取出 batch 中每个样本的 chat 列表 与 image_feat
-        chats = [sample["chat"] for sample in batch]
-        image_feats = [sample["image_feat"] for sample in batch]
+            # 找到最后一个 assistant（更稳）
+            last_asst = None
+            for i in range(len(chat) - 1, -1, -1):
+                if chat[i].get("role") == "assistant":
+                    last_asst = i
+                    break
 
-        # 2. 使用 Qwen 自带的 chat_template 将多轮对话拼成一个长文本
-        texts: List[str] = []
-        for messages in chats:
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,  # 训练时一般不加生成提示
+            if last_asst is None:
+                # 没有 assistant：退化为全 mask（不建议出现）
+                full_msgs = chat
+                prompt_msgs = chat
+            else:
+                full_msgs = chat[: last_asst + 1]
+                prompt_msgs = chat[:last_asst]  # 不含 assistant 内容
+
+            full_texts.append(
+                self.tokenizer.apply_chat_template(full_msgs, tokenize=False, add_generation_prompt=False)
             )
-            texts.append(text)
+            prompt_texts.append(
+                self.tokenizer.apply_chat_template(prompt_msgs, tokenize=False, add_generation_prompt=True)
+            )
 
-        # 3. 将 batch 的文本一起 tokenizer，做 padding & truncation
-        tokenized = self.tokenizer(
-            texts,
+        full_enc = self.tokenizer(
+            full_texts,
+            padding="max_length",
+            truncation=True,
             max_length=self.max_length,
-            padding=True,       # batch 内对齐长度
-            truncation=True,    # 超长则截断
             return_tensors="pt",
-            return_token_type_ids=False, #去掉type_ids
+            return_token_type_ids=False,
+        )
+        prompt_enc = self.tokenizer(
+            prompt_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+            return_token_type_ids=False,
         )
 
-        # 4. labels = input_ids（不掩码 user 部分）
-        input_ids = tokenized["input_ids"]
-        labels = input_ids.clone()
-        # 将 padding 位置设为 -100
-        labels[tokenized["attention_mask"] == 0] = -100
-        tokenized["labels"] = labels
+        labels = full_enc["input_ids"].clone()
+        labels[full_enc["attention_mask"] == 0] = -100
 
-        # 5. 堆叠 image_feat: list[Tensor(D_img)] -> Tensor(B, D_img)
-        img_tensors = []
-        for feat in image_feats:
-            feat = torch.as_tensor(feat, dtype=torch.float32)
-            if feat.dim() > 1:
-                feat = feat.view(-1)  # e.g. [1,512] -> [512]
-            img_tensors.append(feat)
-        img_batch = torch.stack(img_tensors, dim=0)  # [B, D_img]
+        prompt_lens = prompt_enc["attention_mask"].sum(dim=1)
+        for i, l in enumerate(prompt_lens.tolist()):
+            l = min(int(l), labels.size(1))
+            labels[i, :l] = -100
 
-        tokenized["image_feat"] = img_batch
-
-
-        return tokenized
+        full_enc["labels"] = labels
+        full_enc["image_feat"] = torch.stack(feats, dim=0)
+        return full_enc
 
 
 # ===========================
@@ -84,145 +89,181 @@ class LlavaMedChatCollator:
 # ===========================
 @dataclass
 class VQATextDataCollator:
-    """
-    文本-only 模式的 collator：
-
-    - 使用 tokenizer.apply_chat_template 构造对话：
-        [system] (可选)
-        [user]      -> question (+ 提示当前看不到图像)
-        [assistant] -> answer
-    - 然后统一 padding / truncation
-    - labels 对所有非 padding token 监督（后续你可以改成只监督 assistant 段）
-    """
-
-    tokenizer: PreTrainedTokenizerBase
+    tokenizer: Any
     max_length: int = 512
-    system_prompt: Optional[str] = None
-    add_image_hint: bool = True
+    system_prompt: str = ""
+    add_image_hint: bool = False
 
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        conversations: List[str] = []
+    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        prompt_texts = []
+        full_texts = []
 
-        for f in features:
-            q = f["question"]
-            a = f["answer"]
+        for ex in examples:
+            q = str(ex["question"])
+            a = str(ex["answer"])
 
-            messages: List[Dict[str, str]] = []
-            if self.system_prompt:
-                messages.append({"role": "system", "content": self.system_prompt})
-
-            user_content = q
+            sys = self.system_prompt or ""
             if self.add_image_hint:
-                user_content = (
-                    "You are a medical AI assistant.\n"
-                    "You do NOT have access to the image, only the text question.\n\n"
-                    f"Question: {q}"
-                )
-            messages.append({"role": "user", "content": user_content})
-            messages.append({"role": "assistant", "content": a})
+                sys = (sys + "\nIn this training stage you will NOT see the image, only the text question.\n").strip()
 
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
+            # full conversation (has assistant answer)
+            full_msgs = [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": q},
+                {"role": "assistant", "content": a},
+            ]
+            full_text = self.tokenizer.apply_chat_template(
+                full_msgs, tokenize=False, add_generation_prompt=False
             )
-            conversations.append(text)
+            full_texts.append(full_text)
 
-        enc = self.tokenizer(
-            conversations,
-            padding=True,
+            # prompt-only conversation (stops at assistant start)
+            prompt_msgs = full_msgs[:-1]  # drop assistant answer
+            prompt_text = self.tokenizer.apply_chat_template(
+                prompt_msgs, tokenize=False, add_generation_prompt=True
+            )
+            prompt_texts.append(prompt_text)
+
+        full_enc = self.tokenizer(
+            full_texts,
+            padding="max_length",
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
+            return_token_type_ids=False,
         )
-        input_ids = enc["input_ids"]
-        attention_mask = enc["attention_mask"]
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
+        prompt_enc = self.tokenizer(
+            prompt_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+            return_token_type_ids=False,
+        )
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
+        labels = full_enc["input_ids"].clone()
+        # mask padding
+        labels[full_enc["attention_mask"] == 0] = -100
 
+        # mask prompt part (system+user+assistant_start)
+        prompt_lens = prompt_enc["attention_mask"].sum(dim=1)  # [B]
+        for i, l in enumerate(prompt_lens.tolist()):
+            l = min(int(l), labels.size(1))
+            labels[i, :l] = -100
+
+        full_enc["labels"] = labels
+        return full_enc
 
 # ===========================
 # Data Collator：多模态
 # ===========================
+def image_sha1_key(img: Image.Image) -> str:
+    """
+    与 gen_vqa_rad_path_pt.py 完全一致的 key 策略：
+    sha1(RGB像素 + size + "RGB"标记)
+
+    ⚠️ 注意：不要对 img 做随机增强/裁剪，否则 key 会改变，查不到特征。
+    """
+    if not isinstance(img, Image.Image):
+        img = Image.fromarray(img)
+
+    img = img.convert("RGB")
+    raw = img.tobytes()
+
+    h = hashlib.sha1()
+    h.update(b"RGB")
+    h.update(str(img.size).encode("utf-8"))
+    h.update(raw)
+    return h.hexdigest()
+
+
+class PtImageFeatStore:
+    """
+    一个轻量、可复用的 pt 特征仓库（CPU 上）：
+    - 只在初始化时 torch.load 一次
+    - get_by_pil(img) -> Tensor[D]
+    """
+    def __init__(self, pt_path: str):
+        if not os.path.exists(pt_path):
+            raise FileNotFoundError(f"[PtImageFeatStore] pt file not found: {pt_path}")
+
+        payload = torch.load(pt_path, map_location="cpu")
+
+        # 兼容两种保存格式：
+        # 1) {"meta":..., "features":{key:tensor}, "failed":[...]}  (你当前脚本就是这种)
+        # 2) {key:tensor}  (极简格式)
+        if isinstance(payload, dict) and "features" in payload:
+            self.meta = payload.get("meta", {})
+            self.features = payload["features"]
+        elif isinstance(payload, dict):
+            self.meta = {}
+            self.features = payload
+        else:
+            raise TypeError(f"[PtImageFeatStore] Unsupported pt payload type: {type(payload)}")
+
+        if not isinstance(self.features, dict) or len(self.features) == 0:
+            raise RuntimeError(f"[PtImageFeatStore] Empty features in pt: {pt_path}")
+
+        # 推断维度（用于 debug/兜底）
+        any_feat = next(iter(self.features.values()))
+        if not isinstance(any_feat, torch.Tensor):
+            any_feat = torch.tensor(any_feat)
+        self.feat_dim = int(any_feat.numel())
+
+    def get_by_pil(self, img: Image.Image) -> torch.Tensor:
+        key = image_sha1_key(img)
+        if key not in self.features:
+            raise KeyError(
+                f"[PtImageFeatStore] Key not found in pt: {key}\n"
+                f"Hint: make sure training-side key strategy is identical to pt generation."
+            )
+        feat = self.features[key]
+        if not isinstance(feat, torch.Tensor):
+            feat = torch.tensor(feat)
+        return feat
+
+
 @dataclass
-class VQAMultimodalDataCollator:
+class VQAMultimodalPtDataCollator:
     """
-    多模态模式的 collator：
+    ✅ 推荐：Stage-2 multi 的离线特征版 collator
+    - 不跑 BiomedCLIP
+    - 不碰 CUDA
+    - 只负责把 pt 里的 image_feat 拼进 batch
 
-    - 使用 BiomedCLIPBackbone.preprocess + encode_image 将图像编码为 [B, D_img] 特征
-    - 使用 tokenizer.apply_chat_template 构造对话：
-        [system] (可选)
-        [user]      -> question
-        [assistant] -> answer
-    - 返回：
-        input_ids, attention_mask, labels, image_feat
-      其中 image_feat 会被 HF Trainer 自动作为关键字参数传入 model.forward(image_feat=...)
+    参数
+    ----
+    text_collator:
+        你现有的 VQATextDataCollator（负责 input_ids/labels/chat template）
+    image_feat_pt_path:
+        离线生成的 .pt 文件路径（config 顶层 vqa_rad_pt_output/path_vqa_pt_output）
+    strict:
+        True  -> 缺特征直接报错（建议）
+        False -> 缺特征用 0 向量兜底（只用于 debug）
     """
-
-    tokenizer: PreTrainedTokenizerBase
-    biomed_clip: BiomedCLIPBackbone
-    max_length: int = 512
-    system_prompt: Optional[str] = None
+    text_collator: Any
+    image_feat_pt_path: str
+    strict: bool = True
 
     def __post_init__(self):
-        # BiomedCLIP 模型内部自己会管理 device，这里只保留一个标记
-        self.device = self.biomed_clip.device
+        self.store = PtImageFeatStore(self.image_feat_pt_path)
 
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        images = [f["image"] for f in features]
-        questions = [f["question"] for f in features]
-        answers = [f["answer"] for f in features]
+    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # 1) 文本部分：完全复用你现有逻辑
+        batch = self.text_collator(examples)
 
-        # 1) 图像编码 -> BiomedCLIP 特征
-        with torch.no_grad():
-            # preprocess 返回单张图的 transform，这里逐张处理再 cat 成 batch
-            pixel_list = [self.biomed_clip.preprocess(img).unsqueeze(0) for img in images]
-            pixel_values = torch.cat(pixel_list, dim=0)  # [B, 3, H, W]
-            pixel_values = pixel_values.to(self.device)
+        # 2) 图像特征：CPU 查表 + stack
+        feats = []
+        for ex in examples:
+            try:
+                img = ex["image"]  # 你的 vqa_rad_path_hf.py 返回 PIL.Image（image_transform=None）
+                feat = self.store.get_by_pil(img)
+            except Exception:
+                if self.strict:
+                    raise
+                feat = torch.zeros(self.store.feat_dim, dtype=torch.float16)
+            feats.append(feat)
 
-            image_feat = self.biomed_clip.encode_image(pixel_values)  # [B, D] 或 [B, 1, D]
-            if image_feat.ndim == 3:
-                # 兼容 [B, 1, D] 的情况
-                image_feat = image_feat.squeeze(1)
-            image_feat = image_feat.float().cpu()  # 先搬回 CPU，Trainer 会自动分发到各自设备
+        batch["image_feat"] = torch.stack(feats, dim=0)  # (B, D)
+        return batch
 
-        # 2) 文本部分 -> chat 模板
-        conversations: List[str] = []
-        for q, a in zip(questions, answers):
-            messages: List[Dict[str, str]] = []
-            if self.system_prompt:
-                messages.append({"role": "system", "content": self.system_prompt})
-            messages.append({"role": "user", "content": f"Question: {q}"})
-            messages.append({"role": "assistant", "content": a})
-
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            conversations.append(text)
-
-        enc = self.tokenizer(
-            conversations,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        input_ids = enc["input_ids"]
-        attention_mask = enc["attention_mask"]
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "image_feat": image_feat,
-        }

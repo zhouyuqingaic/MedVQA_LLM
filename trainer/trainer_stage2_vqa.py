@@ -37,7 +37,7 @@ from med_vqa_datasets.vqa_rad_path_hf import (
     build_hf_vqa_dataset)  # 调用 HF 封装
 from med_vqa_datasets.collators import (
     VQATextDataCollator,
-    VQAMultimodalDataCollator)
+    VQAMultimodalPtDataCollator)
 
 
 # 项目内模块
@@ -208,57 +208,44 @@ def run_training(rank: int, world_size: int, config: Dict[str, Any]):
                 if name.startswith("image_proj") or name.startswith("cross_attn") or name.startswith("gate"):
                     param.requires_grad = False
 
+
         # 5) 构建 Dataset & DataCollator
+        train_dataset = build_hf_vqa_dataset(
+            dataset_name=DATASET_NAME,
+            split=TRAIN_SPLIT,
+            cache_dir=data_cache_dir,
+            max_samples=MAX_TRAIN_SAMPLES,
+        )
+        eval_dataset = build_hf_vqa_dataset(
+            dataset_name=DATASET_NAME,
+            split=EVAL_SPLIT,
+            cache_dir=data_cache_dir,
+            max_samples=MAX_EVAL_SAMPLES,
+        )
+        # --- collator: build two versions to avoid prompt contradiction ---
+        text_collator_text = VQATextDataCollator(
+            tokenizer=tokenizer,
+            max_length=MAX_LENGTH,
+            system_prompt=system_prompt,
+            add_image_hint=True,  # ✅ only for text-only
+        )
+
+        text_collator_multi = VQATextDataCollator(
+            tokenizer=tokenizer,
+            max_length=MAX_LENGTH,
+            system_prompt=system_prompt,
+            add_image_hint=False,  # ✅ multi should NOT say "you will NOT see the image"
+        )
+
         if modality == "text":
-            if rank == 0:
-                print("[Stage2] 使用文本-only VQA 数据集（不加载图像特征，仅使用 question/answer 文本）。")
-
-            train_dataset = build_hf_vqa_dataset(
-                dataset_name=DATASET_NAME,
-                split=TRAIN_SPLIT,
-                cache_dir=data_cache_dir,
-                max_samples=MAX_TRAIN_SAMPLES,
-            )
-            eval_dataset = build_hf_vqa_dataset(
-                dataset_name=DATASET_NAME,
-                split=EVAL_SPLIT,
-                cache_dir=data_cache_dir,
-                max_samples=MAX_EVAL_SAMPLES,
-            )
-
-            data_collator = VQATextDataCollator(
-                tokenizer=tokenizer,
-                max_length=MAX_LENGTH,
-                system_prompt=system_prompt,
-                add_image_hint=True,
-            )
-        else:  # modality == "multi"
-            if rank == 0:
-                print("[Stage2] 使用多模态 VQA 数据集（图像 + 文本）。")
-
-            train_dataset = build_hf_vqa_dataset(
-                dataset_name=DATASET_NAME,
-                split=TRAIN_SPLIT,
-                cache_dir=data_cache_dir,
-                max_samples=MAX_TRAIN_SAMPLES,
-            )
-            eval_dataset = build_hf_vqa_dataset(
-                dataset_name=DATASET_NAME,
-                split=EVAL_SPLIT,
-                cache_dir=data_cache_dir,
-                max_samples=MAX_EVAL_SAMPLES,
-            )
-
-            biomed_clip = BiomedCLIPBackbone(
-                model_dir=stage2_cfg["biomedclip_model_dir"],
-                device=torch.device(f"cuda:{current_device}"),
-            )
-
-            data_collator = VQAMultimodalDataCollator(
-                tokenizer=tokenizer,
-                biomed_clip=biomed_clip,
-                max_length=MAX_LENGTH,
-                system_prompt=system_prompt,
+            data_collator = text_collator_text
+        else:
+            pt_path = config["vqa_rad_pt_output"]
+            # keep your PT feature collator
+            data_collator = VQAMultimodalPtDataCollator(
+                text_collator=text_collator_multi,
+                image_feat_pt_path=pt_path,
+                strict=True,
             )
 
         if rank == 0:

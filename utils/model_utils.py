@@ -84,7 +84,8 @@ def build_qlora_base_model(
         quantization_config=bnb_config,
         device_map={"": device},  # 固定到当前进程的 GPU
         trust_remote_code=trust_remote_code,
-        dtype=compute_dtype,
+        dtype=compute_dtype,  # <-- replace dtype
+        attn_implementation="sdpa",  # 开启SDPA加速，后期也可以使用flash-attention加速
     )
 
     # 3. 准备 k-bit 训练 (冻结/cast 一些模块)

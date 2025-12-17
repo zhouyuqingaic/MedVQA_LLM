@@ -21,13 +21,18 @@ gpus: "0,1,2,3"    # 或 "0,1,2,3" 等，根据你机器改
 stage1_ckpt_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/med_stage1_align_output"
 
 # 默认模态（可被命令行 --modality 覆盖）
-modality: "text"   # "text" 或 "multi"
+modality: "multi"   # "text" 或 "multi"
 
 # ==========================
 # 数据缓存路径（HF datasets）
 # ==========================
 vqa_rad_cache: "/home/yuqing/Datas/vqa-rad/vqa-rad"
 path_vqa_cache: "/home/yuqing/Datas/vqa-rad/path-vqa"
+# 你原来已有的字段保持不变（例如 dataset_name, data_root 等）
+# 新增：
+vqa_rad_pt_output: "/home/yuqing/Datas/vqa-rad/vqa-rad/vqa_rad_biomedclip_imagefeat.pt"
+path_vqa_pt_output: "/home/yuqing/Datas/vqa-rad/path-vqa/path_vqa_biomedclip_imagefeat.pt"
+
 
 
 # ---------------------------

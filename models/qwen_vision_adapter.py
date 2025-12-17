@@ -192,15 +192,19 @@ class QwenWithVisionAdapter(nn.Module):
         logits = self.llm.lm_head(hidden_states)  # [B, L, vocab_size]
 
         # 4) 计算 loss（如果提供了 labels）
+        # inside QwenWithVisionAdapter.forward, after logits computed
         loss = None
         if labels is not None:
-            vocab_size = logits.size(-1)
+            # Causal LM shift: predict token t+1 at position t
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            vocab_size = shift_logits.size(-1)
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(
-                logits.view(-1, vocab_size),
-                labels.view(-1),
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
             )
-
         return {"loss": loss, "logits": logits}
 
     # ------------------------------------------------------------------

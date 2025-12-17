@@ -48,7 +48,7 @@ gpus: "0,1,2,3"
 
 # 训练超参数
 # ---------------------------------------------------------
-micro_batch_size: 4              # 每个 GPU 的 batch size
+micro_batch_size: 8              # 每个 GPU 的 batch size
 gradient_accumulation_steps: 4   # 梯度累积步数
 learning_rate: 2.0e-4
 epochs: 3                        # 建议先 1 epoch 跑通流程，再按需调大
@@ -65,7 +65,7 @@ system_prompt: "You are a helpful medical vision-language assistant. Describe th
 # ---------------------------------------------------------
 lora:
   r: 16
-  alpha: 32
+  alpha: 128
   dropout: 0.05
   target_modules:
     - "q_proj"
