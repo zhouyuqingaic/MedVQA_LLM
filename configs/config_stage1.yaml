@@ -29,8 +29,14 @@ llava_med_image_feature_dir: "/home/yuqing/Datas/llava_med_images_biomedclip_pt"
 
 
 
-# BiomedCLIP embedding 维度（从 BiomedCLIP config 里可知是 512）
-image_feat_dim: 512
+# tokens 的最后一维（ViT-B/16 的 width）
+image_token_dim: 768
+# Stage-1 实际喂给 Adapter 的向量维度（= image_token_dim）
+image_feat_dim: 768
+# tokens -> vector 的池化方式（cls / mean）
+image_token_pool: "cls"
+
+
 
 
 #BiomedCLIP的feature_batch_size
@@ -52,7 +58,7 @@ micro_batch_size: 8              # 每个 GPU 的 batch size
 gradient_accumulation_steps: 4   # 梯度累积步数
 learning_rate: 2.0e-4
 epochs: 3                        # 建议先 1 epoch 跑通流程，再按需调大
-max_length: 1024                 # chat template 展开后的最大 token 长度
+max_length: 512                # chat template 展开后的最大 token 长度
 
 num_workers: 4                  # DataLoader 的 num_workers（多卡时每个进程的 worker 数）
 max_samples: null            # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null

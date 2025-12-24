@@ -83,6 +83,7 @@ def run_training(rank: int, world_size: int, config: Dict[str, Any]):
         data_collator = LlavaMedChatCollator(
             tokenizer=tokenizer,
             max_length=MAX_LENGTH,
+            image_token_pool=str(config.get("image_token_pool", "cls")),
         )
 
         # ------------------ 6. 组装 TrainingArguments ------------------

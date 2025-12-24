@@ -41,7 +41,10 @@ def build_vision_llm(
     MODEL_PATH = config["model_path"]
     lora_cfg = config.get("lora", {})
     vision_cfg = config.get("vision_adapter", {})
-    image_feat_dim = int(config.get("image_feat_dim", 512))
+    # Stage-1 统一到 tokens(768)：
+    # - 离线特征文件是 Tensor[T, 768]（tokens）
+    # - Dataset 侧会按 config.image_token_pool 池化成一个向量 [768]
+    image_feat_dim = int(config.get("image_token_dim", 768))
 
     vision_enabled = bool(vision_cfg.get("enabled", False))
     prefix_dropout = float(vision_cfg.get("prefix_dropout", 0.0))

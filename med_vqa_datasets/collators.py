@@ -4,9 +4,7 @@
 职责： 集中处理各种 Dataset 的 Collate 函数。
 """
 
-import torch
-from typing import List, Dict, Any
-from transformers import PreTrainedTokenizerBase
+
 from PIL import Image
 import os
 
@@ -14,15 +12,13 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 import hashlib
 import torch
-from transformers import PreTrainedTokenizerBase
-
-from backbones.biomedclip_backbone import BiomedCLIPBackbone
 
 
 @dataclass
 class LlavaMedChatCollator:
     tokenizer: Any
     max_length: int = 512
+    image_token_pool: str = "cls"  # cls / mean
 
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         prompt_texts, full_texts = [], []
@@ -30,7 +26,40 @@ class LlavaMedChatCollator:
 
         for ex in examples:
             chat = ex["chat"]
-            feats.append(ex["image_feat"])
+
+            # ====== [新增] 防御式池化兜底：支持 [D] 或 [T,D] ======
+            feat = ex["image_feat"]
+            if not torch.is_tensor(feat):
+                feat = torch.as_tensor(feat)
+
+            # 如果是 tokens：[T, D] -> [D]
+            if feat.dim() == 2:
+                pool = (self.image_token_pool or "cls").lower()
+
+                # 兼容 [1, D]（有些数据会多一维）
+                if feat.size(0) == 1:
+                    feat = feat.squeeze(0)
+                else:
+                    if pool == "cls":
+                        feat = feat[0]  # 默认 tokens[0] 是 CLS
+                    elif pool == "mean":
+                        # 注意：这里 mean 会包含 CLS；如果你想排除 CLS，用 feat[1:].mean(0)
+                        feat = feat.mean(dim=0)
+                    else:
+                        raise ValueError(
+                            f"Unknown image_token_pool={self.image_token_pool!r}, expected 'cls' or 'mean'.")
+            # 如果是 [D]，保持不动
+            elif feat.dim() == 1:
+                pass
+            else:
+                raise ValueError(f"Unsupported image_feat ndim={feat.dim()} shape={tuple(feat.shape)}")
+
+            # 最终必须是 [D]
+            if feat.dim() != 1:
+                raise ValueError(f"After pooling, expect 1D image_feat [D], got shape={tuple(feat.shape)}")
+
+            feats.append(feat)
+            # ====== [新增结束] ======
 
             # 找到最后一个 assistant（更稳）
             last_asst = None
@@ -56,7 +85,7 @@ class LlavaMedChatCollator:
 
         full_enc = self.tokenizer(
             full_texts,
-            padding="max_length",
+            padding="longest",
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
@@ -64,7 +93,7 @@ class LlavaMedChatCollator:
         )
         prompt_enc = self.tokenizer(
             prompt_texts,
-            padding="max_length",
+            padding="longest",
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
@@ -80,7 +109,7 @@ class LlavaMedChatCollator:
             labels[i, :l] = -100
 
         full_enc["labels"] = labels
-        full_enc["image_feat"] = torch.stack(feats, dim=0)
+        full_enc["image_feat"] = torch.stack(feats, dim=0)  # (B, D)
         return full_enc
 
 

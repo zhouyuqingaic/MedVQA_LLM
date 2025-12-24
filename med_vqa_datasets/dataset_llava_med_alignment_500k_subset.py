@@ -163,6 +163,13 @@ class LLaVAMedAlignmentDataset(Dataset):
                 "请检查 llava_med_image_feature_dir 下是否已经生成对应的 .pt 文件。"
             )
 
+        """
+        关键点：你现在 pt 存的是 Tensor[T,768]（或 dict 里带 tokens/image_tokens/...），Stage-1 Dataset 统一输出 image_feat: Tensor[768]。
+        """
+        self.image_token_dim = int(cfg.get("image_token_dim", 768))
+        self.image_feat_dim = int(cfg.get("image_feat_dim", self.image_token_dim))
+        self.image_token_pool = str(cfg.get("image_token_pool", "cls")).lower()
+
     # ------------------------------
     # Dataset 标准接口
     # ------------------------------
@@ -171,49 +178,61 @@ class LLaVAMedAlignmentDataset(Dataset):
         return len(self.samples)
 
     def _load_image_feature(self, feat_path: str) -> torch.Tensor:
-        """
-        从 .pt 文件中加载图像特征，并做一些兼容性处理。
-
-        兼容格式：
-        1) 直接保存的 tensor  (shape: [512] 或 [1, 512])
-        2) dict:
-            - 包含 "img_feat" 或 "image_emb" key，对应 tensor / numpy
-        """
         feat_obj = torch.load(feat_path, map_location="cpu")
 
-        # 如果是 dict，优先找常见 key
+        # dict：优先 tokens，再兼容旧 key
         if isinstance(feat_obj, dict):
-            if "img_feat" in feat_obj:
+            if "tokens" in feat_obj:
+                feat = feat_obj["tokens"]
+            elif "image_tokens" in feat_obj:
+                feat = feat_obj["image_tokens"]
+            elif "token_embeddings" in feat_obj:
+                feat = feat_obj["token_embeddings"]
+            elif "patch_tokens" in feat_obj:
+                feat = feat_obj["patch_tokens"]
+            elif "img_feat" in feat_obj:
                 feat = feat_obj["img_feat"]
             elif "image_emb" in feat_obj:
                 feat = feat_obj["image_emb"]
             else:
-                # 如果没有这些 key，尝试直接把整个 dict 转成 tensor (很少这样用)
-                raise ValueError(
-                    f"不支持的特征 dict 格式: keys={list(feat_obj.keys())} in {feat_path}"
-                )
+                raise ValueError(f"Unsupported dict keys={list(feat_obj.keys())} in {feat_path}")
         else:
             feat = feat_obj
 
-        # 兼容 numpy
         if not isinstance(feat, torch.Tensor):
             feat = torch.as_tensor(feat, dtype=torch.float32)
-
-        # 确保是 float32
         feat = feat.float()
 
-        # 统一展平到一维向量
-        if feat.ndim > 1:
-            feat = feat.view(-1)
+        # [1, T, C] -> [T, C]
+        if feat.dim() == 3:
+            if feat.size(0) != 1:
+                raise ValueError(f"3D tokens should be [1,T,C], got {tuple(feat.shape)} ({feat_path})")
+            feat = feat.squeeze(0)
 
-        # 检查维度
-        if feat.numel() != self.image_feat_dim:
+        # 2D：tokens [T,C] or vector [1,C]
+        if feat.dim() == 2:
+            if feat.size(0) == 1 and feat.size(1) == self.image_feat_dim:
+                vec = feat.squeeze(0)  # [C]
+            else:
+                if feat.size(-1) != self.image_token_dim:
+                    raise ValueError(
+                        f"tokens last-dim mismatch: expect {self.image_token_dim}, got {feat.size(-1)} ({feat_path})")
+                if self.image_token_pool == "cls":
+                    vec = feat[0]
+                elif self.image_token_pool == "mean":
+                    vec = feat.mean(dim=0)
+                else:
+                    raise ValueError(f"Unknown image_token_pool={self.image_token_pool!r}")
+        elif feat.dim() == 1:
+            vec = feat
+        else:
+            raise ValueError(f"Unsupported feature ndim={feat.dim()} for {feat_path}")
+
+        if vec.numel() != self.image_feat_dim:
             raise ValueError(
-                f"特征维度不匹配: 期望 {self.image_feat_dim}, 实际 {feat.numel()} "
-                f"(文件: {feat_path})"
-            )
+                f"feature dim mismatch after pooling: expect {self.image_feat_dim}, got {vec.numel()} ({feat_path})")
 
-        return feat
+        return vec
 
     def _build_chat_from_sample(self, sample: Dict[str, Any]) -> List[Dict[str, str]]:
         """
