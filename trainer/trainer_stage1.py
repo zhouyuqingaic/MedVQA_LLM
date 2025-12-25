@@ -1,169 +1,180 @@
-# engine/trainer_stage1.py
+# trainer/trainer_stage1.py
 # -*- coding: utf-8 -*-
 """
-创建引擎层 Trainer 核心逻辑
-我们将原 trainer_stage1.py 中的 run_training 函数，并替换所有内部依赖为 utils 和 engine 层的函数。
+Stage-1 Trainer（LLaVA-Med alignment, tokens-route）
+================================================
 
-职责： Stage 1 训练的核心逻辑执行器。
-负责： DDP 初始化，模型/数据集构建，HF Trainer 组装和训练循环。
+单一路线（强一致，方便排错）：
+  - Dataset: LLaVAMedAlignmentDataset（离线 tokens + 原始 chat）
+  - Collator: LlavaMedChatCollator（answer-only labels + tokens padding）
+  - Model: QwenVisionPatchPrefixModel（逐 token projector + prefix concat）
+
+运行：
+  python trainer/trainer_stage1.py --config configs/config_stage1.yaml
 """
 
-import torch
-from typing import Dict, Any
+from __future__ import annotations
 
+import inspect
+import argparse
 import os
 import sys
+from typing import Any, Dict
 
+import torch
+from transformers import Trainer, TrainingArguments
 
-from transformers import TrainingArguments, Trainer
+from utils.config import get_gpus_and_world_size, load_config
+from utils.ddp import cleanup_ddp, launch_ddp, setup_ddp
+from utils.builder import build_vision_llm
 
-# === 从 Utils 层导入依赖 ===
-from utils.ddp import setup_ddp, cleanup_ddp,launch_ddp
-from utils.config import load_config,get_gpus_and_world_size  # 理论上 launch_ddp 的调用者会加载 config
-# from utils.model_utils import load_tokenizer # 现已移入 builder
-
-# === 从 Data 层导入依赖 ===
 from med_vqa_datasets.dataset_llava_med_alignment_500k_subset import build_llava_med_dataset
 from med_vqa_datasets.collators import LlavaMedChatCollator
 
-# === 从 Engine 层导入依赖 ===
-from utils.builder import build_vision_llm
+
+def _build_trainer(**kwargs):
+    """
+    transformers 新版本引入 processing_class 并逐步弃用 tokenizer；
+    但不能同时传 tokenizer 和 processing_class，否则会 ValueError。
+    这里做一个兼容层：优先用 processing_class（如果 Trainer 支持），否则回退到 tokenizer。
+    """
+    sig = inspect.signature(Trainer.__init__)
+
+    if "processing_class" in sig.parameters:
+        # ✅ 新版：只传 processing_class，不要再让 kwargs 里残留 tokenizer
+        proc = kwargs.pop("processing_class", None)
+        tok = kwargs.pop("tokenizer", None)
+        if proc is None:
+            proc = tok
+        # 确保 tokenizer 不会再被传进去
+        kwargs.pop("tokenizer", None)
+        return Trainer(**kwargs, processing_class=proc)
+
+    # ✅ 旧版：Trainer 还没有 processing_class，只能传 tokenizer
+    kwargs.pop("processing_class", None)
+    return Trainer(**kwargs)
 
 
-def run_training(rank: int, world_size: int, config: Dict[str, Any]):
+def _resolve_precision(cfg: Dict[str, Any]) -> tuple[bool, bool, torch.dtype]:
     """
-    每个 GPU / rank 上启动的训练函数 (由 utils.ddp.launch_ddp 调用)。
+    统一处理 bf16/fp16/fp32：
+    - 优先使用显式 fp16/bf16
+    - 若都没开，则走 fp32（更稳但更慢）
     """
+    use_bf16 = bool(cfg.get("bf16", True))
+    use_fp16 = bool(cfg.get("fp16", False))
+
+    if use_bf16 and use_fp16:
+        raise ValueError("[Stage1] bf16 and fp16 cannot both be True.")
+
+    if use_bf16:
+        return True, False, torch.bfloat16
+    if use_fp16:
+        return False, True, torch.float16
+    return False, False, torch.float32
+
+
+def run_training(rank: int, world_size: int, config: Dict[str, Any]) -> None:
     try:
-        # ------------------ 1. 初始化 DDP (使用 utils/ddp) ------------------
-        # setup_ddp 会自动处理 MASTER_ADDR/PORT 和 CUDA_VISIBLE_DEVICES
         setup_ddp(rank, world_size)
-        current_device = torch.cuda.current_device()
 
         if rank == 0:
-            print(f"[Stage1] 启动训练进程，Rank={rank}, World Size={world_size}")
-            print(f"[Stage1] 使用模型: {config['model_path']}")
-            print(f"[Stage1] 输出目录: {config['output_dir']}")
+            print(f"[Stage1] Rank={rank} | world_size={world_size}")
+            print(f"[Stage1] model_path: {config['model_path']}")
+            print(f"[Stage1] output_dir: {config['output_dir']}")
 
-        # ------------------ 2. 读取关键配置 ------------------
-        OUTPUT_DIR = config["output_dir"]
-        MICRO_BATCH_SIZE = int(config.get("micro_batch_size", 4))
-        GRAD_ACC_STEPS = int(config.get("gradient_accumulation_steps", 4))
-        LEARNING_RATE = float(config.get("learning_rate", 2e-4))
-        EPOCHS = int(config.get("epochs", 1))
-        MAX_LENGTH = int(config.get("max_length", 1024))
-        NUM_WORKERS = int(config.get("num_workers", 4))
-        MAX_SAMPLES = config.get("max_samples", None)
+        # ---- training hyperparams ----
+        output_dir = config["output_dir"]
+        micro_bs = int(config.get("micro_batch_size", 4))
+        grad_acc = int(config.get("gradient_accumulation_steps", 4))
+        lr = float(config.get("learning_rate", 2e-4))
+        epochs = float(config.get("epochs", 1))
+        max_length = int(config.get("max_length", 1024))
+        num_workers = int(config.get("num_workers", 4))
 
-        # bf16 配置 (从 config 中提取)
-        use_bf16 = config.get("bf16", True)
-        compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
+        use_bf16, use_fp16, compute_dtype = _resolve_precision(config)
 
-        # ------------------ 3. 构建模型和 Tokenizer (使用 engine/builder) ------------------
-        model, tokenizer, image_feat_dim = build_vision_llm(
+        # ---- model + tokenizer ----
+        model, tokenizer, _image_token_dim = build_vision_llm(
             config=config,
             rank=rank,
             compute_dtype=compute_dtype,
         )
 
-        # ------------------ 4. 准备 Dataset (使用 med_vqa_datasets) ------------------
+        # ---- dataset ----
         if rank == 0:
-            print("[Stage1] 构建 LlavaMedAlignBiomedCLIPDataset ...")
+            print("[Stage1] Building dataset...")
+        train_dataset = build_llava_med_dataset(config, split="train", verbose=(rank == 0))
 
-        # build_llava_med_dataset 应该从 config 中读取 llava_med_json/image_feature_dir
-        dataset = build_llava_med_dataset(config, split="train", verbose=True)
-
-        full_len = len(dataset)
         if rank == 0:
-            print(f"[Stage1][Dataset] 样本总数: {full_len}")
-            if MAX_SAMPLES is not None:
-                print(f"[Stage1][Dataset] 仅使用前 {MAX_SAMPLES} 条样本做训练（调试用）")
+            print(f"[Stage1] Train samples: {len(train_dataset)}")
 
-        # ------------------ 5. 构建自定义 Collator (使用 med_vqa_datasets/collators) ------------------
-        data_collator = LlavaMedChatCollator(
-            tokenizer=tokenizer,
-            max_length=MAX_LENGTH,
-            image_token_pool=str(config.get("image_token_pool", "cls")),
-        )
+        # ---- collator ----
+        data_collator = LlavaMedChatCollator(tokenizer=tokenizer, max_length=max_length)
 
-        # ------------------ 6. 组装 TrainingArguments ------------------
+        # ---- HF TrainingArguments ----
         training_args = TrainingArguments(
-            output_dir=OUTPUT_DIR,
-            per_device_train_batch_size=MICRO_BATCH_SIZE,
-            gradient_accumulation_steps=GRAD_ACC_STEPS,
-            num_train_epochs=EPOCHS,
-            learning_rate=LEARNING_RATE,
-            fp16=False,
+            output_dir=output_dir,
+            per_device_train_batch_size=micro_bs,
+            gradient_accumulation_steps=grad_acc,
+            num_train_epochs=epochs,
+            learning_rate=lr,
             bf16=use_bf16,
+            fp16=use_fp16,
             logging_steps=10,
             save_strategy="epoch",
-            ddp_find_unused_parameters=False,
             report_to="none",
-            gradient_checkpointing=True,
+            gradient_checkpointing = True,
+            gradient_checkpointing_kwargs = {"use_reentrant": False},
             optim="paged_adamw_32bit",
-            dataloader_num_workers=NUM_WORKERS,
-            remove_unused_columns=False,  # 确保 'image_feat' 不被干掉
+            dataloader_num_workers=num_workers,
+            remove_unused_columns=False,  # 必须保留 image_tokens / image_token_mask
+            ddp_find_unused_parameters=False,
             local_rank=rank,
         )
 
-        # ------------------ 7. 构建 Trainer 并开始训练 ------------------
-        trainer = Trainer(
+        trainer = _build_trainer(
             model=model,
             args=training_args,
-            train_dataset=dataset,
-            tokenizer=tokenizer,
+            train_dataset=train_dataset,
             data_collator=data_collator,
+            tokenizer=tokenizer,  # _build_trainer 会兼容新/旧版
         )
 
         trainer.train()
 
-        # 仅让 rank 0 做最终保存
         if rank == 0:
-            trainer.save_model(OUTPUT_DIR)
-            print(f"[Stage1] 训练完成，模型已保存至: {OUTPUT_DIR}")
+            trainer.save_model(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            print(f"[Stage1] Done. Saved to: {output_dir}")
 
-        # ------------------ 8. 清理 DDP (使用 utils/ddp) ------------------
         cleanup_ddp()
 
     except Exception as e:
-        print(f"[Stage1][Rank {rank}] 发生错误: {e}")
+        print(f"[Stage1][Rank {rank}] Error: {e}")
         import traceback
+
         traceback.print_exc()
         cleanup_ddp()
         sys.exit(1)
 
 
-def main():
-    """
-    主入口：
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="../configs/config_stage1.yaml", help="Path to config_stage1.yaml")
+    args = parser.parse_args()
 
-    1. 读取 config_stage1.yaml
-    2. 解析 GPU 列表
-    3. 使用 launch_ddp 启动 run_training
-    """
-    # 1. 加载配置
-    # 假设配置文件位于项目根目录下的 configs/ 文件夹
-    config_path = "configs/config_stage1.yaml"
-    if not os.path.exists(config_path):
-        # 兼容一下原代码中使用的相对路径
-        config_path = "../configs/config_stage1.yaml"
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_cfg = os.path.join(project_root, "configs", "config_stage1.yaml")
+    cfg_path = args.config or default_cfg
 
-    config = load_config(config_path)
+    config = load_config(cfg_path)
 
-    # 2. 解析 GPU 列表和 World Size (使用 utils/config)
     gpus, world_size = get_gpus_and_world_size(config)
-
-    # 设置 CUDA_VISIBLE_DEVICES 环境变量
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
 
-    print(f"[Stage1 Main] 准备在以下 GPU 上启动训练: {gpus} (Total: {world_size})")
-
-    # 3. 使用 launch_ddp 启动多进程训练 (使用 utils/ddp)
-    launch_ddp(
-        target_fn=run_training,
-        world_size=world_size,
-        config=config,
-    )
+    print(f"[Stage1] GPUs={gpus} | world_size={world_size}")
+    launch_ddp(run_training, world_size=world_size, config=config)
 
 
 if __name__ == "__main__":

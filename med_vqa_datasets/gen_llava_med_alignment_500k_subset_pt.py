@@ -290,6 +290,8 @@ def worker(rank: int, world_size: int, cfg: Dict[str, Any], args: argparse.Names
 def main() -> None:
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--config", type=str, default=None, help="Path to config_stage1.yaml")
+
     # 你要求保留的参数
     parser.add_argument("--gpus", type=str, default=None, help="例如 '0,1,2,3'（覆盖 config 里的 gpus）")
     parser.add_argument("--batch_size", type=int, default=64, help="每次 forward 的 batch_size")
@@ -303,8 +305,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # 固定读取 configs/config_stage1.yaml（项目内约定）
-    cfg_path = "../configs/config_stage1.yaml"
+    # 读取配置（默认：项目根目录下 configs/config_stage1.yaml）
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_cfg = os.path.join(project_root, "configs", "config_stage1.yaml")
+    cfg_path = args.config or default_cfg
     cfg = load_config(cfg_path)
 
     # 设置可见 GPU 列表（重要：DDP 里 rank 会对应 CUDA_VISIBLE_DEVICES 的索引）

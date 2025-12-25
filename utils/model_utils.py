@@ -1,46 +1,44 @@
 # utils/model_utils.py
 # -*- coding: utf-8 -*-
+"""
+model_utils.py
+==============
 
+封装三件事：
+1) Tokenizer 加载（确保 pad_token 正确）
+2) QLoRA 4-bit 量化配置（bitsandbytes）
+3) 基座 LLM 加载 + 注入 LoRA（PEFT）
+
+说明
+----
+- 本项目使用 HuggingFace Transformers + PEFT + bitsandbytes
+- 为了可读性，函数粒度保持“能单测、好定位问题”
 """
-职责： 封装大语言模型 (LLM) 的加载、量化 (QLoRA) 和 Peft/LoRA 适配器配置逻辑。
-"""
+
+from __future__ import annotations
+
+from typing import Any, Dict
 
 import torch
-from typing import Dict, Any, Optional
-
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-)
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-    TaskType,
-    PeftModel,
-)
 from torch.nn import Module
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 
 
 def load_tokenizer(model_path: str, trust_remote_code: bool = True):
-    """
-    加载并配置 Tokenizer。
-    确保 pad_token 被正确设置。
-    """
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=trust_remote_code,
-    )
+    """加载并配置 tokenizer，确保 pad_token 可用。"""
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+
+    # Qwen2.x 有时 pad_token 为空；为了 batch padding，通常把 pad 设为 eos
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     return tokenizer
 
 
-def get_qlora_bnb_config(compute_dtype=torch.bfloat16) -> BitsAndBytesConfig:
-    """
-    生成标准的 QLoRA 4-bit 量化配置。
-    """
+def get_qlora_bnb_config(compute_dtype: torch.dtype = torch.bfloat16) -> BitsAndBytesConfig:
+    """标准 QLoRA 4-bit 量化配置。"""
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
@@ -50,73 +48,61 @@ def get_qlora_bnb_config(compute_dtype=torch.bfloat16) -> BitsAndBytesConfig:
 
 
 def build_qlora_base_model(
-        model_path: str,
-        lora_cfg: Dict[str, Any],
-        device: torch.device,
-        compute_dtype: torch.dtype = torch.bfloat16,
-        trust_remote_code: bool = True,
+    *,
+    model_path: str,
+    lora_cfg: Dict[str, Any],
+    device: torch.device,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    trust_remote_code: bool = True,
 ) -> Module:
     """
-    加载基座 LLM (4bit 量化) 并注入 LoRA Adapter。
+    加载基座 LLM（4bit 量化）并注入 LoRA Adapter。
 
-    参数
-    ----
-    model_path : str
-        预训练 LLM 的路径。
-    lora_cfg : dict
-        从 config 中读取的 LoRA 参数字典 (r, alpha, dropout, target_modules)。
-    device : torch.device
-        模型要加载到的目标设备。
-    compute_dtype : torch.dtype
-        计算时使用的 dtype (如 torch.bfloat16)。
-
-    返回
-    ----
-    model : PeftModel
-        带有 LoRA Adapter 的 QLoRA 模型。
+    返回：
+      - PeftModel（内部持有被量化的 base model）
     """
-    # 1. 量化配置
     bnb_config = get_qlora_bnb_config(compute_dtype=compute_dtype)
 
-    # 2. 加载基础 LLM
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_path,
+    # Transformers 推荐用 torch_dtype，而不是 dtype（dtype 有时会被忽略）
+    common_kwargs = dict(
+        pretrained_model_name_or_path=model_path,
         quantization_config=bnb_config,
-        device_map={"": device},  # 固定到当前进程的 GPU
+        device_map={"": str(device)},
         trust_remote_code=trust_remote_code,
-        dtype=compute_dtype,  # <-- replace dtype
-        attn_implementation="sdpa",  # 开启SDPA加速，后期也可以使用flash-attention加速
+        attn_implementation="sdpa",
     )
 
-    # 3. 准备 k-bit 训练 (冻结/cast 一些模块)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        **common_kwargs,
+        dtype=compute_dtype,  # 新版
+    )
+
+    # k-bit 训练准备：冻结/转换部分模块，避免精度/梯度问题
     base_model = prepare_model_for_kbit_training(base_model)
 
-    # 4. 注入 LoRA Adapter 配置
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
         r=int(lora_cfg.get("r", 16)),
         lora_alpha=int(lora_cfg.get("alpha", 32)),
         lora_dropout=float(lora_cfg.get("dropout", 0.05)),
-        target_modules=lora_cfg["target_modules"],
+        target_modules=lora_cfg.get("target_modules", []),
     )
 
-    # 5. 注入 LoRA Adapter
-    model = get_peft_model(base_model, peft_config)
-    return model
+    return get_peft_model(base_model, peft_config)
 
 
-# 如果您希望在 utils/model_utils.py 中添加一个打印可训练参数的辅助函数：
-def print_trainable_parameters(model: Module, rank: int = 0):
-    """
-    打印模型可训练参数的统计信息（仅在 Rank 0 打印）。
-    """
-    if rank == 0 and hasattr(model, "print_trainable_parameters"):
+def print_trainable_parameters(model: Module, rank: int = 0) -> None:
+    """打印可训练参数统计（只在 rank0 打印）。"""
+    if rank != 0:
+        return
+
+    # PEFT 模型自带更详细的 print_trainable_parameters
+    if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
-    elif rank == 0:
-        # 针对非 PeftModel 的普通 nn.Module 计算
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print("LoRA trainable 参数统计 (非PeftModel计算)：")
-        print(
-            f"trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {trainable_params / total_params * 100:.4f}")
+        return
+
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    pct = 100.0 * trainable / max(total, 1)
+    print(f"trainable params: {trainable:,} || all params: {total:,} || trainable%: {pct:.4f}")

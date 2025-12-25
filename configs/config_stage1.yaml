@@ -1,76 +1,46 @@
-# 模型与数据路径
-# ---------------------------------------------------------
-# Qwen 文本模型（和 stage0 保持一致）
+# configs/config_stage1.yaml
+# Tokens Route (Full Patch Tokens) - Stage 1 Alignment
+
+# ----------------------------
+# Runtime
+# ----------------------------
+gpus: "4,5"
+
+# ----------------------------
+# Model
+# ----------------------------
 model_path: "/home/yuqing/Models/Qwen2.5-7B-Instruct"
 
-# LLaVA-Med 对齐数据（你给的 llava_med_alignment_500k_subset.json）
+# ----------------------------
+# Data (LLaVA-Med alignment)
+# ----------------------------
 llava_med_json: "/home/yuqing/Datas/llava_med_alignment_500k_subset.json"
-
-# 对应图片目录
-llava_med_image_root: "/home/yuqing/Datas/llava_med_images"
-
-# 训练输出目录（权重 + 日志）
-output_dir: "../med_stage1_align_output"
-
-# BiomedCLIP 模型所在目录（biomedclip_backbone.py 里 LOCAL_DIR）
-biomedclip_model_dir: "/home/yuqing/Models/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-
-
-# 预提取 BiomedCLIP 图像特征
-# ---------------------------------------------------------
-# 你已经用 BiomedCLIPBackbone 跑过 600K 图像，把每张图片的全局特征保存成 .pt：
-#   /home/yuqing/Datas/llava_med_images/xxx.jpg
-#   -> /home/yuqing/Datas/llava_med_images_biomedclip_pt/xxx.pt
-#
-# 要求：
-#   - 特征是 1D 向量（形状 [512] 或 [1, 512]），可以是 tensor 或 numpy 数组
-#   - 如果保存成 dict，也可以，脚本会优先找 key: "img_feat" / "image_emb"
 llava_med_image_feature_dir: "/home/yuqing/Datas/llava_med_images_biomedclip_pt"
 
-
-
-# tokens 的最后一维（ViT-B/16 的 width）
+# 离线特征：patch tokens [T, 768]（例如 T=197）
 image_token_dim: 768
-# Stage-1 实际喂给 Adapter 的向量维度（= image_token_dim）
-image_feat_dim: 768
-# tokens -> vector 的池化方式（cls / mean）
-image_token_pool: "cls"
+
+# 可选 system prompt（Stage-1 推荐：短、稳、对齐 LLaVA 风格）
+#Stage‑1 对齐阶段：优先用 方案 A。因为 alignment 数据很多时候是“描述/问答/解释”风格，
+# system 太“安全化”可能会让模型在训练时学到“动不动加免责声明”的偏好（跟监督答案分布不一致）。
+system_prompt: |
+  A chat between a curious user and an AI medical assistant.
+  The assistant gives helpful, detailed, and polite answers about biomedical images and medical topics.
+  Ground the answer in the provided image and the user's question; do not invent findings or measurements.
+  If the question cannot be answered from the given information, say you are unsure and briefly explain what is missing.
+  Keep the final answer concise unless the user asks for more detail.
 
 
+# ----------------------------
+# Output
+# ----------------------------
+output_dir: "../med_stage1_align_output"
 
-
-#BiomedCLIP的feature_batch_size
-feature_batch_size: 64
-# DataLoader 的 num_workers
-feature_num_workers: 4
-
-# 是否用 FP16 提特征（显存更省，一般 True 即可）
-feature_fp16: False
-
-# ---------------------------------------------------------
-# 例如: "4,5,6,7" => 使用物理 GPU 4/5/6/7；程序内部看到的是 cuda:0~3
-gpus: "0,1,2,3"
-
-
-# 训练超参数
-# ---------------------------------------------------------
-micro_batch_size: 8              # 每个 GPU 的 batch size
-gradient_accumulation_steps: 4   # 梯度累积步数
-learning_rate: 2.0e-4
-epochs: 3                        # 建议先 1 epoch 跑通流程，再按需调大
-max_length: 512                # chat template 展开后的最大 token 长度
-
-num_workers: 4                  # DataLoader 的 num_workers（多卡时每个进程的 worker 数）
-max_samples: null            # 调试用：比如设为 2000 只用前 2000 条，不限则设为 null
-
-# 可选：给 LLM 一个统一的 system prompt
-system_prompt: "You are a helpful medical vision-language assistant. Describe the medical image in accurate and concise English."
-
-
-# LoRA 配置（和 stage0 保持一致）
-# ---------------------------------------------------------
+# ----------------------------
+# LoRA / QLoRA
+# ----------------------------
 lora:
-  r: 16
+  r: 64
   alpha: 128
   dropout: 0.05
   target_modules:
@@ -82,28 +52,29 @@ lora:
     - "up_proj"
     - "down_proj"
 
-
-# Vision Adapter（Prefix Token 版）配置
-# ---------------------------------------------------------
+# ----------------------------
+# Vision wrapper (Tokens Route)
+# ----------------------------
 vision_adapter:
-  enabled: true          # 是否启用图像前缀 token；设为 false 即退化为纯文本 Qwen + LoRA
-  type: "cross_attn"         # 目前只实现 prefix 版，后续可以扩展 cross_attn 等
-  use_image_feat: true   # 是否真的用 image_feat，如果做 ablation 可以关掉
-  prefix_dropout: 0.0    # prefix token 上的 dropout，通常 0 或 0.1
-  num_prefix_tokens: 64  #多 token 模式的token数
+  type: "patch_prefix"        # ✅ 关键：LLaVA-style prefix 拼接（全 tokens）
+  use_image_feat: true        # 保持字段名不变，表示启用图像分支
+  prefix_dropout: 0.0
 
-  # ==== 以下是 Cross-Attn Adapter 专用配置 ====
-  num_image_tokens: 4      # 把 image_feat 投影成多少个视觉 token M
-  cross_attn_heads: 8      # Cross-Attn 的多头数量
-  cross_attn_dropout: 0.0  # Cross-Attn 内部 dropout，建议 0 ~ 0.1
-  use_gate: true           # 是否使用可学习 gate 控制视觉注入强度
+  # projector：逐 token 翻译 768 -> Qwen hidden(4096)
+  projector_type: "linear"    # linear / mlp
+  projector_hidden_dim: 768   # projector_type=mlp 时生效
+  layer_norm: false           # projector 前 LN（可选）
 
-  # ==== 新增：Projector 配置 ====
-  # linear / mlp / multihead / moe
-  projector_type: "multihead"
+# ----------------------------
+# Training
+# ----------------------------
+micro_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 2.0e-4
+epochs: 1
+max_length: 1024
+num_workers: 8
+bf16: true
 
-  # 对应不同类型的可选超参（用不到可以留空或删掉）
-  mlp_hidden_dim: 512          # None 表示使用 input_dim
-  multihead_inner_dim: 512     # None 表示使用 input_dim
-  moe_num_experts: 4
-  moe_top_k: 2
+# 调试用：限制样本数
+# max_samples: 2000

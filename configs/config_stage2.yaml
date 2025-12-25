@@ -1,50 +1,58 @@
 # configs/config_stage2.yaml
 #
-# 统一的 Stage-2 配置文件：
-# - 顶层有公共配置：gpus、stage1_ckpt_dir
-# - text: 文本-only 模式专用配置
-# - multi: 多模态模式专用配置
-#
-# 注意：
-#   1. text 和 multi 两块下面的字段会直接传给 engine.builder.build_vision_llm，
-#      因此需要包含：
-#          - model_path
-#          - lora: { r, alpha, dropout, target_modules }
-#          - vision_adapter: { enabled, type, ... }
-#          - image_feat_dim
-#   2. 如果你想完全复用 Stage-1 的结构，只需把 Stage-1 的这些字段复制过来即可。
-#   3. Stage-2 会使用 stage1_ckpt_dir 加载 Stage-1 训练好的权重。
+# Stage-2 (VQA-RAD / PathVQA) config — tokens-route version
+# ---------------------------------------------------------
+# 目标：
+# - 继续加载 Stage-1 checkpoint（LoRA + patch_prefix projector）
+# - text: 纯文本训练（结构仍保持一致，便于加载 stage1；但不喂 image_tokens）
+# - multi: 多模态训练（从离线 .pt tokens cache 查表，prefix 拼接）
 
-gpus: "0,1,2,3"    # 或 "0,1,2,3" 等，根据你机器改
+gpus: "0,1,2,3"
 
-# Stage-1 输出目录（就是你给出的那个路径）
-stage1_ckpt_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/med_stage1_align_output"
+# Stage-1 输出目录（Trainer 会从这里加载 model.safetensors / pytorch_model.bin）
+stage1_ckpt_dir: "/path/to/med_stage1_align_output"
 
-# 默认模态（可被命令行 --modality 覆盖）
-modality: "multi"   # "text" 或 "multi"
+# 默认模态（可通过命令行 --modality 覆盖）
+modality: "multi"   # "text" or "multi"
 
-# ==========================
-# 数据缓存路径（HF datasets）
-# ==========================
-vqa_rad_cache: "/home/yuqing/Datas/vqa-rad/vqa-rad"
-path_vqa_cache: "/home/yuqing/Datas/vqa-rad/path-vqa"
-# 你原来已有的字段保持不变（例如 dataset_name, data_root 等）
-# 新增：
-vqa_rad_pt_output: "/home/yuqing/Datas/vqa-rad/vqa-rad/vqa_rad_biomedclip_imagefeat.pt"
-path_vqa_pt_output: "/home/yuqing/Datas/vqa-rad/path-vqa/path_vqa_biomedclip_imagefeat.pt"
+# --------------------------
+# HF datasets cache paths
+# --------------------------
+vqa_rad_cache: "/path/to/hf_cache/vqa-rad"
+path_vqa_cache: "/path/to/hf_cache/path-vqa"
 
+# --------------------------
+# Offline BiomedCLIP tokens cache (.pt)
+# --------------------------
+# 由脚本生成：
+#   python med_vqa_datasets/gen_vqa_rad_path_pt.py --feature_type tokens --config configs/config_stage2.yaml
+vqa_rad_pt_output: "/path/to/vqa_rad_biomedclip_tokens.pt"
+path_vqa_pt_output: "/path/to/path_vqa_biomedclip_tokens.pt"
 
+# （可选）如果你也想用 gen_vqa_rad_path_pt.py 抽特征，需要提供 BiomedCLIP 本地目录
+# biomedclip_model_dir: "/path/to/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
 
-# ---------------------------
-# 文本-only Stage-2 配置
-# ---------------------------
+# =========================================================
+# Stage-2 text-only
+# =========================================================
 text:
-  # === 与 Stage-1 构模相关的部分（请保持一致） ===
-  model_path: "/home/yuqing/Models/Qwen2.5-7B-Instruct"
-  image_feat_dim: 512
+  model_path: "/path/to/Qwen2.5-7B-Instruct"
+
+  # tokens dim 必须与 .pt 里的 tokens 一致（ViT-B/16 通常 768）
+  image_token_dim: 768
+
+  # Vision adapter：仍然保持 patch_prefix 结构，以便加载 stage1 权重；
+  # 但关闭 use_image_feat -> forward 自动走纯文本分支
+  vision_adapter:
+    type: "patch_prefix"
+    use_image_feat: false
+    prefix_dropout: 0.0
+    projector_type: "linear"     # linear / mlp
+    projector_hidden_dim: 768    # mlp 时可用
+    layer_norm: false
 
   lora:
-    r: 16          # 这里也一样改成 16
+    r: 16
     alpha: 128
     dropout: 0.05
     target_modules:
@@ -56,26 +64,11 @@ text:
       - "up_proj"
       - "down_proj"
 
-  vision_adapter:
-    enabled: true               # 仍然使用 Stage-1 的 Vision Adapter 结构
-    type: "cross_attn"          # 或 "prefix" —— 请与 Stage-1 保持一致
-    num_image_tokens: 4
-    cross_attn_heads: 8
-    cross_attn_dropout: 0.0
-    use_gate: true
-    use_image_feat: false       # 🌟 关键：文本-only 模式关闭图像分支（但结构仍是多模态）
-    projector_type: "mlp"
-    mlp_hidden_dim: null
-    multihead_inner_dim: null
-    moe_num_experts: 4
-    moe_top_k: 2
-    prefix_dropout: 0.0         # 若使用 prefix，可在此处设置
-
-  # === Stage-2 训练相关超参 ===
-  output_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/stage2_vqa_text_path_vqa" #或者stage2_vqa_text_vqa_rad,stage2_vqa_text_path_vqa
-  dataset_name: "path-vqa"       # 或 "path-vqa","vqa-rad"
+  # ---- training ----
+  output_dir: "/path/to/stage2_vqa_text_output"
+  dataset_name: "vqa-rad"        # "vqa-rad" or "path-vqa"
   train_split: "train"
-  eval_split: "test"            # 对于 path-vqa 可以设置为 "validation"
+  eval_split: "test"
   cache_dir: null
 
   micro_batch_size: 4
@@ -86,7 +79,7 @@ text:
   max_length: 512
   num_workers: 4
   bf16: true
-  max_train_samples: null       # 调试时可以设成 512
+  max_train_samples: null
   max_eval_samples: null
   seed: 42
 
@@ -95,16 +88,23 @@ text:
     In this training stage you will NOT see the image, only the text question.
     Please answer as accurately and concisely as possible.
 
-# ---------------------------
-# 多模态 Stage-2 配置
-# ---------------------------
+# =========================================================
+# Stage-2 multimodal (offline tokens)
+# =========================================================
 multi:
-  # === 与 Stage-1 构模相关的部分（请保持一致） ===
-  model_path: "/home/yuqing/Models/Qwen2.5-7B-Instruct"
-  image_feat_dim: 512
+  model_path: "/path/to/Qwen2.5-7B-Instruct"
+  image_token_dim: 768
+
+  vision_adapter:
+    type: "patch_prefix"
+    use_image_feat: true
+    prefix_dropout: 0.0
+    projector_type: "linear"
+    projector_hidden_dim: 768
+    layer_norm: false
 
   lora:
-    r: 16          # 这里也一样改成 16
+    r: 16
     alpha: 128
     dropout: 0.05
     target_modules:
@@ -116,38 +116,13 @@ multi:
       - "up_proj"
       - "down_proj"
 
-  vision_adapter:
-    enabled: true
-    type: "cross_attn"
-
-    # ✅ 多模态阶段必须打开图像分支
-    use_image_feat: true
-
-    prefix_dropout: 0.0
-    num_prefix_tokens: 64
-
-    num_image_tokens: 4
-    cross_attn_heads: 8
-    cross_attn_dropout: 0.0
-    use_gate: true
-
-    projector_type: "multihead"
-    mlp_hidden_dim: 512
-    multihead_inner_dim: 512
-    moe_num_experts: 4
-    moe_top_k: 2
-
-  # BiomedCLIP 模型目录（需替换成你本地的路径）
-  biomedclip_model_dir: "/home/yuqing/Models/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-
-  # === Stage-2 训练相关超参 ===
-  output_dir: "/home/yuqing/RemoteProjects/MedVQA_LLM_P03/stage2_vqa_multi_path_vqa" #或者:stage2_vqa_multi_vqa_rad,stage2_vqa_multi_path_vqa
-  dataset_name: "path-vqa"       # 或 "path-vqa","vqa-rad"
+  output_dir: "/path/to/stage2_vqa_multi_output"
+  dataset_name: "vqa-rad"
   train_split: "train"
   eval_split: "test"
   cache_dir: null
 
-  micro_batch_size: 2           # 多模态一般显存更紧张
+  micro_batch_size: 2
   eval_batch_size: 2
   gradient_accumulation_steps: 4
   learning_rate: 1.0e-4
@@ -161,5 +136,5 @@ multi:
 
   system_prompt: |
     You are a helpful medical AI assistant for visual question answering on radiology/pathology images.
-    You will receive both the image (encoded by BiomedCLIP) and the text question.
+    You will receive both the image (encoded into patch tokens) and the text question.
     Please provide concise and accurate answers.

@@ -1,130 +1,116 @@
-# engine/builder.py
+# utils/builder.py
 # -*- coding: utf-8 -*-
 """
-职责： 集中处理模型的所有构建和包装逻辑。
-包括：加载 Tokenizer, 构建 QLoRA 基座模型，并将其包装为 Vision VLM。
+builder.py
+==========
+
+目标：把“加载 Tokenizer + 加载 QLoRA 基座 + 包装 tokens-route 视觉前缀”的逻辑集中到一处，
+避免 trainer 脚本里散落一堆构模细节，降低可维护性。
+
+当前版本只保留一个明确的多模态路线：
+- Vision Adapter: `patch_prefix`（逐 token projector + prefix 拼接）
+
+这样做的好处：
+- 代码路径单一，调试更容易
+- 与 Stage-1 的训练目标完全对齐（answer-only loss + prefix labels=-100）
+
+配置约定（来自 YAML）
+--------------------
+config:
+  model_path: "/path/to/Qwen"
+  image_token_dim: 768
+  lora: {...}
+  vision_adapter:
+    type: "patch_prefix"
+    use_image_feat: true/false   # false => 纯文本模式（结构仍保持一致，便于加载 stage1 ckpt）
+    prefix_dropout: 0.0
+    projector_type: "linear" or "mlp"
+    projector_hidden_dim: 768    # projector_type=mlp 时可用
+    layer_norm: false
 """
 
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
 import torch
-from typing import Dict, Any, Optional
 from torch.nn import Module
 
-# 从 utils 层导入必要的工具
-from utils.model_utils import load_tokenizer, build_qlora_base_model, print_trainable_parameters
-from models.qwen_vision_prefix import QwenVisionPrefixModel
-from models.qwen_vision_adapter import QwenWithVisionAdapter   # 新增
+from utils.model_utils import (
+    load_tokenizer,
+    build_qlora_base_model,
+    print_trainable_parameters,
+)
+from models.qwen_vision_patch_prefix import QwenVisionPatchPrefixModel
 
 
 def build_vision_llm(
-        config: Dict[str, Any],
-        rank: int,
-        compute_dtype: torch.dtype = torch.bfloat16,
-) -> tuple[Module, Any, int]:
+    config: Dict[str, Any],
+    rank: int,
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> Tuple[Module, Any, int]:
     """
-    构建完整的 Vision LLM 模型 (QLoRA + Vision Prefix Adapter) 和 Tokenizer。
-
-    参数
-    ----
-    config : dict
-        完整的配置字典。
-    rank : int
-        当前进程的 DDP Rank。
-    compute_dtype : torch.dtype
-        模型使用的计算类型 (bf16/fp16)。
+    构建完整的 Vision LLM（QLoRA + tokens-route Vision Prefix）以及 Tokenizer。
 
     返回
     ----
-    (model, tokenizer, image_feat_dim)
+    model:
+        QwenVisionPatchPrefixModel（内部包含 QLoRA base LLM）
+    tokenizer:
+        HuggingFace tokenizer（Trainer 里会作为 processing_class/tokenizer 使用）
+    image_token_dim:
+        图像 token 的最后一维（通常 768）
     """
 
-    # 1. 提取关键配置
-    MODEL_PATH = config["model_path"]
-    lora_cfg = config.get("lora", {})
-    vision_cfg = config.get("vision_adapter", {})
-    # Stage-1 统一到 tokens(768)：
-    # - 离线特征文件是 Tensor[T, 768]（tokens）
-    # - Dataset 侧会按 config.image_token_pool 池化成一个向量 [768]
-    image_feat_dim = int(config.get("image_token_dim", 768))
+    model_path = config["model_path"]
+    lora_cfg = config.get("lora", {}) or {}
+    vision_cfg = config.get("vision_adapter", {}) or {}
 
-    vision_enabled = bool(vision_cfg.get("enabled", False))
-    prefix_dropout = float(vision_cfg.get("prefix_dropout", 0.0))
-    use_image_feat = bool(vision_cfg.get("use_image_feat", True))
+    image_token_dim = int(config.get("image_token_dim", 768))
 
-    # 2. 准备 Tokenizer (使用 utils/model_utils)
-    tokenizer = load_tokenizer(MODEL_PATH, trust_remote_code=True)
+    # ---- 1) Tokenizer ----
+    tokenizer = load_tokenizer(model_path, trust_remote_code=True)
 
-    # 3. 加载 QLoRA 基座模型 (使用 utils/model_utils)
-    # 当前进程所使用的逻辑 GPU 设备
-    current_device = torch.device(f"cuda:{rank}")
+    # ---- 2) Base LLM (QLoRA + LoRA) ----
+    device = torch.device(f"cuda:{rank}") if torch.cuda.is_available() else torch.device("cpu")
 
     base_model = build_qlora_base_model(
-        model_path=MODEL_PATH,
+        model_path=model_path,
         lora_cfg=lora_cfg,
-        device=current_device,
+        device=device,
         compute_dtype=compute_dtype,
+        trust_remote_code=True,
     )
 
-    # 打印可训练参数统计 (仅 Rank 0)
+    # 避免 gradient checkpointing 时反复打印 use_cache warning
+    if hasattr(base_model, "config"):
+        base_model.config.use_cache = False
+
     if rank == 0:
-        print("[Stage1] LoRA trainable 参数统计：")
+        print("[Builder] LoRA trainable 参数统计：")
         print_trainable_parameters(base_model, rank=rank)
 
-    # 4. 包装 Vision Prefix Adapter
-    if vision_enabled:
-        adapter_type = vision_cfg.get("type", "prefix")
+    # ---- 3) Vision Adapter（只保留 patch_prefix 一条路） ----
+    adapter_type = (vision_cfg.get("type") or "patch_prefix").lower()
+    if adapter_type != "patch_prefix":
+        raise ValueError(
+            f"[Builder] Unsupported vision_adapter.type={adapter_type!r}. "
+            "This refactored codebase keeps only 'patch_prefix' to reduce legacy complexity."
+        )
 
-        if adapter_type == "prefix":
-            # ----------------- 原有 Prefix Token 模式 -----------------
-            if rank == 0:
-                print("[Stage1] 使用 Vision Prefix Adapter (global + slot tokens)")
+    model = QwenVisionPatchPrefixModel(
+        llm=base_model,
+        image_token_dim=image_token_dim,
+        prefix_dropout=float(vision_cfg.get("prefix_dropout", 0.0)),
+        use_image_tokens=bool(vision_cfg.get("use_image_feat", True)),
+        projector_type=str(vision_cfg.get("projector_type", "linear")),
+        projector_hidden_dim=vision_cfg.get("projector_hidden_dim", None),
+        layer_norm=bool(vision_cfg.get("layer_norm", False)),
+    )
 
-            num_prefix_tokens = int(vision_cfg.get("num_prefix_tokens", 1))
-            model = QwenVisionPrefixModel(
-                llm=base_model,
-                image_feat_dim=image_feat_dim,
-                prefix_dropout=prefix_dropout,
-                use_image_feat=use_image_feat,
-                num_prefix_tokens=num_prefix_tokens,
-            ).to(current_device)
+    # base_model 已经由 device_map 放到目标 GPU，这里只需要把 Adapter 参数移过去即可
+    model.projector.to(device=device, dtype=compute_dtype)
+    if model.ln is not None:
+        model.ln.to(device=device, dtype=compute_dtype)
 
-        elif adapter_type == "cross_attn":
-            # ----------------- 新增 Cross-Attn Adapter 模式 -----------------
-            if rank == 0:
-                print("[Stage1] 使用 Cross-Attn Vision Adapter (QwenWithVisionAdapter)")
-
-            num_image_tokens = int(vision_cfg.get("num_image_tokens", 4))
-            cross_attn_heads = int(vision_cfg.get("cross_attn_heads", 8))
-            cross_attn_dropout = float(vision_cfg.get("cross_attn_dropout", 0.0))
-            use_gate = bool(vision_cfg.get("use_gate", True))
-
-            # 新增：Projector 相关配置
-            projector_type = vision_cfg.get("projector_type", "mlp")
-            mlp_hidden_dim = vision_cfg.get("mlp_hidden_dim", None)
-            multihead_inner_dim = vision_cfg.get("multihead_inner_dim", None)
-            moe_num_experts = int(vision_cfg.get("moe_num_experts", 4))
-            moe_top_k = int(vision_cfg.get("moe_top_k", 2))
-
-            model = QwenWithVisionAdapter(
-                llm=base_model,
-                image_feat_dim=image_feat_dim,
-                num_image_tokens=num_image_tokens,
-                cross_attn_heads=cross_attn_heads,
-                cross_attn_dropout=cross_attn_dropout,
-                use_image_feat=use_image_feat,
-                use_gate=use_gate,
-                projector_type=projector_type,
-                mlp_hidden_dim=mlp_hidden_dim,
-                multihead_inner_dim=multihead_inner_dim,
-                moe_num_experts=moe_num_experts,
-                moe_top_k=moe_top_k,
-            ).to(current_device)
-
-        else:
-            raise ValueError(f"[Stage1] 未知的 vision_adapter.type = {adapter_type}")
-    else:
-        if rank == 0:
-            print("[Stage1] 未启用 Vision Adapter，退化为纯文本 Qwen + LoRA")
-        model = base_model
-
-
-    return model, tokenizer, image_feat_dim
+    return model, tokenizer, image_token_dim
